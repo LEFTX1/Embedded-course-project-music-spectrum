@@ -36,27 +36,29 @@ MatrixPanel_I2S_DMA *dma_display = nullptr;
 // --- I2S 和 FFT 配置参数 ---
 #define I2S_SAMPLE_RATE     (16000)
 #define I2S_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
-#define FFT_SAMPLES_COUNT   (256)   // MODIFIED from 512
+#define FFT_SAMPLES_COUNT   (512)   // MODIFIED to 512 for good balance
 
 #define I2S_DMA_BUF_COUNT    (8)
-#define I2S_DMA_BUF_LEN_SAMPLES (FFT_SAMPLES_COUNT) // MODIFIED to match FFT_SAMPLES_COUNT
+#define I2S_DMA_BUF_LEN_SAMPLES (FFT_SAMPLES_COUNT) // Will use 512
 
 // --- FFT 对象和数据数组 (使用 float 以提高性能) ---
-float vReal[FFT_SAMPLES_COUNT];
-float vImag[FFT_SAMPLES_COUNT];
-ArduinoFFT<float> FFT(vReal, vImag, FFT_SAMPLES_COUNT, (float)I2S_SAMPLE_RATE);
+float vReal[FFT_SAMPLES_COUNT]; // Size will be 512
+float vImag[FFT_SAMPLES_COUNT]; // Size will be 512
+ArduinoFFT<float> FFT(vReal, vImag, FFT_SAMPLES_COUNT, (float)I2S_SAMPLE_RATE); // Initialized with 512
 
 // --- 频谱可视化参数 ---
-#define NUM_BANDS (PANEL_WIDTH) // MODIFIED for 1 pixel width per bar
+#define NUM_BANDS (PANEL_WIDTH) // 64 bands, 1px wide each
 
-// --- 分桶参数 (Linear Binning) ---
-#define F_MIN_HZ 40.0f
+// --- 分桶参数 ---
+#define F_MIN_HZ 40.0f // Minimum frequency to map
 int band_start_bins[NUM_BANDS];
 int band_end_bins[NUM_BANDS];
+// FREQ_RESOLUTION will be 16000 / 512 = 31.25 Hz
 const float FREQ_RESOLUTION = (float)I2S_SAMPLE_RATE / FFT_SAMPLES_COUNT;
-const int USEFUL_FFT_BINS = FFT_SAMPLES_COUNT / 2; // Number of magnitude bins from FFT (0 to N/2 - 1)
+// USEFUL_FFT_BINS will be 512 / 2 = 256
+const int USEFUL_FFT_BINS = FFT_SAMPLES_COUNT / 2;
 
-// !! 校准参数 !!
+// !! 校准参数 (VERY LIKELY TO NEED ADJUSTMENT) !!
 #define NOISE_FLOOR 26000.0f
 #define MAX_AMP_LOG 8.8f
 #define MIN_AMP_LOG 4.3f
@@ -67,7 +69,7 @@ float peak_heights[NUM_BANDS];
 unsigned long peak_timers[NUM_BANDS];
 float band_velocities[NUM_BANDS];
 
-#define PEAK_FALL_DELAY 150
+#define PEAK_FALL_DELAY 200
 #define PEAK_FALL_RATE_PIXELS_PER_FRAME 0.3f
 
 // --- 主条行为参数 ---
@@ -127,7 +129,7 @@ void setup_i2s_microphone() {
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = I2S_DMA_BUF_COUNT,
-    .dma_buf_len = I2S_DMA_BUF_LEN_SAMPLES,
+    .dma_buf_len = I2S_DMA_BUF_LEN_SAMPLES, // Will be 512
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
@@ -185,24 +187,105 @@ uint16_t hsv_to_panel_color(float h, float s, float v) {
     return 0;
 }
 
-void calculate_frequency_bins() { // Changed name to be generic, implementing LINEAR binning
-  Serial.println("--- Calculating Linear Frequency Bins ---");
-  float min_possible_freq = FREQ_RESOLUTION; // Freq of FFT bin 1 (e.g., 16000/256 = 62.5 Hz)
-  float min_map_freq = max(F_MIN_HZ, min_possible_freq); // Actual lowest freq to start mapping from
-  float max_map_freq = (float)I2S_SAMPLE_RATE / 2.0f;    // Nyquist frequency (e.g., 16000/2 = 8000 Hz)
+// Logarithmic binning function (kept for comparison if needed)
+void calculate_logarithmic_bins() {
+    Serial.println("--- Calculating Logarithmic Bins (v2) ---");
+    float max_freq_hz = (float)I2S_SAMPLE_RATE / 2.0f;      // 8000 Hz
+    float min_possible_freq = FREQ_RESOLUTION;             // 31.25 Hz with FFT_SAMPLES_COUNT = 512
+    float f_start_for_calc = max(F_MIN_HZ, min_possible_freq); // Effective start freq for log scale
+    float log_min = log10f(f_start_for_calc);
+    float log_max = log10f(max_freq_hz);
+    float log_range = log_max - log_min;
 
+    if (log_range <= 0.001f) {
+        Serial.println("Warning: Logarithmic frequency range is too small. Applying fallback linear-like binning.");
+        int bins_per_display_band = (USEFUL_FFT_BINS -1) / NUM_BANDS; // (256-1)/64 approx 3-4
+        if (bins_per_display_band < 1) bins_per_display_band = 1;
+        for (int i = 0; i < NUM_BANDS; i++) {
+            band_start_bins[i] = max(1, 1 + i * bins_per_display_band);
+            band_end_bins[i] = max(1, band_start_bins[i] + bins_per_display_band - 1);
+            if (i == NUM_BANDS - 1) band_end_bins[i] = USEFUL_FFT_BINS - 1;
+
+            band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1); // Max FFT bin is 255
+            band_end_bins[i]   = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
+            if (band_end_bins[i] < band_start_bins[i]) band_end_bins[i] = band_start_bins[i];
+        }
+        return;
+    }
+
+    for (int i = 0; i < NUM_BANDS; i++) {
+        float band_log_low = log_min + ( (float)i / NUM_BANDS ) * log_range;
+        float band_log_high = log_min + ( (float)(i + 1) / NUM_BANDS ) * log_range;
+        float freq_low_ideal = pow10f(band_log_low);
+        float freq_high_ideal = pow10f(band_log_high);
+        int start_bin_ideal = roundf(freq_low_ideal / FREQ_RESOLUTION);
+        int end_bin_ideal = roundf(freq_high_ideal / FREQ_RESOLUTION) -1;
+
+        if (i == 0) {
+            band_start_bins[i] = max(1, start_bin_ideal);
+        } else {
+            band_start_bins[i] = max(start_bin_ideal, band_end_bins[i-1] + 1);
+        }
+        band_end_bins[i] = max(band_start_bins[i], end_bin_ideal);
+        band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1);
+        band_end_bins[i] = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
+
+        if (band_start_bins[i] > band_end_bins[i]) {
+            band_end_bins[i] = band_start_bins[i];
+        }
+        if (i == NUM_BANDS - 1) {
+            band_end_bins[i] = USEFUL_FFT_BINS - 1;
+            if (band_start_bins[i] > band_end_bins[i]) {
+                 band_start_bins[i] = band_end_bins[i];
+            }
+        }
+        if (band_start_bins[i] >= USEFUL_FFT_BINS -1 && i < NUM_BANDS -1) {
+            for (int j = i; j < NUM_BANDS; ++j) {
+                band_start_bins[j] = USEFUL_FFT_BINS - 1;
+                band_end_bins[j] = USEFUL_FFT_BINS - 1;
+            }
+            #ifdef DEBUG_SERIAL_LEVEL_2
+            Serial.printf("Band %2d onwards mapped to last FFT bin (%d) due to scarcity.\n", i, USEFUL_FFT_BINS - 1);
+            #endif
+            break;
+        }
+        #ifdef DEBUG_SERIAL_LEVEL_2
+        if ( (NUM_BANDS <= 10) || (i < 5 || i >= NUM_BANDS - 5 || (i % (NUM_BANDS/10)) == 0 ) ) {
+            if (millis() - last_print_time_detail > 10 ) { // Reduce spam
+                 Serial.printf("Log Band %2d: Freq_ideal %.0f-%.0f Hz => FFT Bins %3d-%3d (Len %d)\n",
+                              i, freq_low_ideal, freq_high_ideal,
+                              band_start_bins[i], band_end_bins[i], band_end_bins[i] - band_start_bins[i] + 1);
+                 last_print_time_detail = millis();
+            }
+        }
+        #endif
+    }
+    Serial.println("--- Adjusted Low Frequency Bins (First 5 - Logarithmic): ---");
+    for(int i=0; i < min(5, NUM_BANDS); ++i) {
+        float f_low_actual = band_start_bins[i] * FREQ_RESOLUTION;
+        float f_high_actual = (band_end_bins[i] + 1) * FREQ_RESOLUTION;
+         Serial.printf("  Adj LogBand %2d: FFT Bins %3d-%3d (Actual Freq ~%.0f-%.0f Hz)\n",
+                      i, band_start_bins[i], band_end_bins[i], f_low_actual, f_high_actual);
+    }
+    Serial.println("--- Logarithmic Bins Calculated (v2) ---");
+}
+
+// Linear binning function (Recommended for this goal)
+void calculate_linear_bins() {
+  Serial.println("--- Calculating Linear Frequency Bins ---");
+  float min_possible_freq = FREQ_RESOLUTION; // 31.25 Hz with FFT_SAMPLES_COUNT = 512
+  float min_map_freq = max(F_MIN_HZ, min_possible_freq); // Effective start freq for linear scale
+  float max_map_freq = (float)I2S_SAMPLE_RATE / 2.0f;    // Nyquist frequency (8000 Hz)
   float total_freq_span_to_map = max_map_freq - min_map_freq;
 
-  if (total_freq_span_to_map <= 0.001f) { // Check for non-positive or tiny span
+  if (total_freq_span_to_map <= 0.001f) {
       Serial.println("Error: Frequency span for binning is too small or invalid.");
-      // Fallback: Distribute FFT bins as evenly as possible among display bands
-      int bins_per_band = (USEFUL_FFT_BINS -1) / NUM_BANDS;
+      int bins_per_band = (USEFUL_FFT_BINS -1) / NUM_BANDS; // (256-1)/64 approx 3-4
       if (bins_per_band < 1) bins_per_band = 1;
       for (int i = 0; i < NUM_BANDS; i++) {
           band_start_bins[i] = max(1, 1 + i * bins_per_band);
           band_end_bins[i] = max(1, band_start_bins[i] + bins_per_band - 1);
-          if (i == NUM_BANDS -1) band_end_bins[i] = USEFUL_FFT_BINS - 1; // Last band takes the rest
-          
+          if (i == NUM_BANDS -1) band_end_bins[i] = USEFUL_FFT_BINS - 1;
           band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1);
           band_end_bins[i]   = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
           if (band_end_bins[i] < band_start_bins[i]) band_end_bins[i] = band_start_bins[i];
@@ -211,63 +294,65 @@ void calculate_frequency_bins() { // Changed name to be generic, implementing LI
       return;
   }
 
-  float linear_freq_step_per_band = total_freq_span_to_map / NUM_BANDS;
+  float linear_freq_step_per_band = total_freq_span_to_map / NUM_BANDS; // e.g., (8000-40)/64 = 124.375 Hz per band
 
   for (int i = 0; i < NUM_BANDS; i++) {
     float freq_low_ideal = min_map_freq + ((float)i * linear_freq_step_per_band);
     float freq_high_ideal = min_map_freq + ((float)(i + 1) * linear_freq_step_per_band);
-    
     int start_bin_ideal = roundf(freq_low_ideal / FREQ_RESOLUTION);
     int end_bin_ideal = roundf(freq_high_ideal / FREQ_RESOLUTION) - 1;
 
     if (i == 0) {
-      band_start_bins[i] = max(1, start_bin_ideal);
+      band_start_bins[i] = max(1, start_bin_ideal); // Skip DC bin 0
     } else {
-      band_start_bins[i] = max(start_bin_ideal, band_end_bins[i - 1] + 1);
+      band_start_bins[i] = max(start_bin_ideal, band_end_bins[i - 1] + 1); // Ensure no overlap and progression
     }
+    band_end_bins[i] = max(band_start_bins[i], end_bin_ideal); // Ensure end is at least start
     
-    band_end_bins[i] = max(band_start_bins[i], end_bin_ideal);
-    
+    // Constrain to valid FFT bin range
     band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1);
     band_end_bins[i] = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
 
-    if (band_start_bins[i] > band_end_bins[i]) {
+    if (band_start_bins[i] > band_end_bins[i]) { // Should not happen with proper calculation but as a safeguard
       band_end_bins[i] = band_start_bins[i];
     }
 
+    // Ensure the last display band goes up to the last useful FFT bin
     if (i == NUM_BANDS - 1) {
       band_end_bins[i] = USEFUL_FFT_BINS - 1;
-      if (band_start_bins[i] > band_end_bins[i]) {
+      if (band_start_bins[i] > band_end_bins[i]) { // If start is now beyond the max, bring it back
         band_start_bins[i] = band_end_bins[i];
       }
     }
 
+    // If we run out of FFT bins before display bands, map remaining display bands to the last FFT bin
     if (band_start_bins[i] >= USEFUL_FFT_BINS - 1 && i < NUM_BANDS - 1) {
-      for (int j = i; j < NUM_BANDS; ++j) {
+      for (int j = i; j < NUM_BANDS; ++j) { 
         band_start_bins[j] = USEFUL_FFT_BINS - 1;
         band_end_bins[j] = USEFUL_FFT_BINS - 1;
       }
       #ifdef DEBUG_SERIAL_LEVEL_2
       Serial.printf("Band %2d onwards mapped to last FFT bin (%d).\n", i, USEFUL_FFT_BINS - 1);
       #endif
-      break; 
+      break; // Exit the main loop for 'i'
     }
     
     #ifdef DEBUG_SERIAL_LEVEL_2
-    if (millis() - last_print_time_detail > 50 || i < 5 || i > NUM_BANDS - 5) { // Print first/last few and occasionally
-        Serial.printf("Band %2d: Freq_ideal %.0f-%.0f Hz => FFT Bins %3d-%3d (Len %d)\n",
-                      i, freq_low_ideal, freq_high_ideal,
-                      band_start_bins[i], band_end_bins[i], band_end_bins[i] - band_start_bins[i] + 1);
-        last_print_time_detail = millis();
+    if ( (NUM_BANDS <= 10) || (i < 5 || i >= NUM_BANDS - 5 || (i % (NUM_BANDS/10)) == 0 ) ) {
+       if (millis() - last_print_time_detail > 10 ) { // Reduce spam
+            Serial.printf("Lin. Band %2d: Freq_ideal %.0f-%.0f Hz => FFT Bins %3d-%3d (Len %d)\n",
+                          i, freq_low_ideal, freq_high_ideal,
+                          band_start_bins[i], band_end_bins[i], band_end_bins[i] - band_start_bins[i] + 1);
+            last_print_time_detail = millis();
+       }
     }
     #endif
   }
-
   Serial.println("--- Adjusted Low Frequency Bins (First 5 - Linear): ---");
   for (int i = 0; i < min(5, NUM_BANDS); ++i) {
     float f_low_actual = band_start_bins[i] * FREQ_RESOLUTION;
-    float f_high_actual = (band_end_bins[i] + 1) * FREQ_RESOLUTION;
-    Serial.printf("  Adj Band %2d: FFT Bins %3d-%3d (Actual Freq ~%.0f-%.0f Hz)\n",
+    float f_high_actual = (band_end_bins[i] + 1) * FREQ_RESOLUTION; // +1 because end_bin is inclusive
+    Serial.printf("  Adj LinBand %2d: FFT Bins %3d-%3d (Actual Freq ~%.0f-%.0f Hz)\n",
                   i, band_start_bins[i], band_end_bins[i], f_low_actual, f_high_actual);
   }
   Serial.println("--- Linear Frequency Bins Calculated ---");
@@ -276,19 +361,26 @@ void calculate_frequency_bins() { // Changed name to be generic, implementing LI
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Wait for serial monitor
+  delay(1000); 
   Serial.println("Starting setup...");
 
   setup_hub75_display();
   setup_i2s_microphone();
-  calculate_frequency_bins(); // This now calculates LINEAR bins
+
+  // --- CHOOSE BINNING METHOD ---
+  calculate_linear_bins(); // Recommended for clearer high/low differences
+  // calculate_logarithmic_bins(); // Uncomment to test logarithmic binning
 
   // Precompute colors
   precomputed_peak_color = hsv_to_panel_color(0, 0.0f, 1.0f); // White
   for (int i = 0; i < NUM_BANDS; ++i) {
     float hue;
     if (NUM_BANDS > 1) {
-        hue = ((float)i / (NUM_BANDS - 1)) * 240.0f; // Hue from Red (0) to Blue (240)
+        // Displaying with high frequencies on the left, so reverse hue mapping for natural color progression
+        // float display_progress = (float)(NUM_BANDS - 1 - i) / (NUM_BANDS - 1); 
+        // hue = display_progress * 240.0f; // Red (high freq) to Blue (low freq)
+        // OR, if data_idx is already natural order for color:
+        hue = ((float)i / (NUM_BANDS - 1)) * 240.0f; // Hue from Red (0 for low freq data) to Blue (240 for high freq data)
     } else { 
         hue = 0.0f; 
     }
@@ -309,7 +401,7 @@ void setup() {
     band_velocities[i] = 0.0f;
   }
 
-  Serial.println("Setup complete. Starting FFT Spectrum Display (Linear Bins).");
+  Serial.println("Setup complete. Starting FFT Spectrum Display (512 FFT Samples, Linear Bins).");
   if (dma_display) {
       dma_display->clearScreen();
       dma_display->setCursor(1, 8);
@@ -323,7 +415,7 @@ void setup() {
 
 void loop() {
   size_t bytes_actually_read = 0;
-  int32_t i2s_read_buff[FFT_SAMPLES_COUNT]; 
+  int32_t i2s_read_buff[FFT_SAMPLES_COUNT]; // Sized for 512 samples
   const size_t buffer_size_in_bytes = FFT_SAMPLES_COUNT * sizeof(int32_t);
   esp_err_t result = i2s_read(I2S_PORT_NUM, (void*)i2s_read_buff, buffer_size_in_bytes, &bytes_actually_read, pdMS_TO_TICKS(100));
 
@@ -338,16 +430,18 @@ void loop() {
     FFT.compute(FFTDirection::Forward);
     FFT.complexToMagnitude();
 
-    for (int band_idx = 0; band_idx < NUM_BANDS; band_idx++) {
+    for (int band_idx = 0; band_idx < NUM_BANDS; band_idx++) { // band_idx is the index for our display bands (0 to NUM_BANDS-1)
         float max_amplitude_in_band = 0.0f;
-        int start_bin = band_start_bins[band_idx];
+        int start_bin = band_start_bins[band_idx]; // FFT bins corresponding to this display band
         int end_bin = band_end_bins[band_idx];
 
-        // This check is important: only process if the bin range is valid and non-empty
-        if (start_bin < USEFUL_FFT_BINS && end_bin >= start_bin && start_bin > 0) { // Ensure start_bin > 0
+        // USEFUL_FFT_BINS is 256. start_bin/end_bin can go up to 255.
+        if (start_bin < USEFUL_FFT_BINS && end_bin >= start_bin && start_bin > 0) { // Valid bin range
             for (int k = start_bin; k <= end_bin; k++) {
-                 // Additional safety: ensure k is within vReal bounds, though 'constrain' should handle it.
-                if (k < FFT_SAMPLES_COUNT) { // Technically k < USEFUL_FFT_BINS is enough here.
+                // k is an FFT bin index. vReal is sized FFT_SAMPLES_COUNT (512), 
+                // but we only use vReal[0] to vReal[USEFUL_FFT_BINS-1] for magnitude.
+                // So k should be < USEFUL_FFT_BINS (i.e. <= USEFUL_FFT_BINS - 1)
+                if (k < USEFUL_FFT_BINS) { // Ensure k is within the valid magnitude result range
                     if (vReal[k] > max_amplitude_in_band) {
                         max_amplitude_in_band = vReal[k];
                     }
@@ -453,19 +547,29 @@ void loop() {
         if (millis() - peak_timers[i] > PEAK_FALL_DELAY) { peak_heights[i] = max(0.0f, peak_heights[i] - PEAK_FALL_RATE_PIXELS_PER_FRAME);}
      }
   } else { 
-    for (int i = 0; i < NUM_BANDS; i++) {
+    // Optionally print I2S errors if they occur, but can be spammy
+    // if (result != ESP_OK) {
+    //    Serial.printf("I2S Read Error/Incomplete: %s, bytes_read: %u, expected: %u\n", esp_err_to_name(result), bytes_actually_read, buffer_size_in_bytes);
+    // }
+    for (int i = 0; i < NUM_BANDS; i++) { // Reset bars on error or incomplete read
         band_heights[i] = 0; peak_heights[i] = 0; band_velocities[i] = 0.0f;
     }
   }
 
   if (dma_display) {
     dma_display->clearScreen();
-    int bar_width_ideal = PANEL_WIDTH / NUM_BANDS; 
+    int bar_width_ideal = PANEL_WIDTH / NUM_BANDS; // Will be 1
     if (bar_width_ideal < 1) bar_width_ideal = 1;
 
     for (int screen_band_idx = 0; screen_band_idx < NUM_BANDS; screen_band_idx++) {
-      int x = screen_band_idx * bar_width_ideal; 
-      int data_idx = NUM_BANDS - 1 - screen_band_idx;
+      int x = screen_band_idx * bar_width_ideal;
+      // Data for band_heights etc. is in natural frequency order (0=low, NUM_BANDS-1=high)
+      // Display order: screen_band_idx 0 is left-most.
+      // data_idx determines which frequency data populates which screen position.
+      // Current: screen_band_idx 0 (left) shows data_idx NUM_BANDS-1 (high freq data)
+      // This means high frequencies are on the left, low frequencies on the right.
+      int data_idx = NUM_BANDS - 1 - screen_band_idx; 
+      // If you want low frequencies on the left: int data_idx = screen_band_idx;
 
       int current_bar_width = bar_width_ideal; 
       if (x + current_bar_width > PANEL_WIDTH) {
@@ -473,6 +577,7 @@ void loop() {
       }
       
       int h_int = (int)roundf(band_heights[data_idx]);
+      // Color is precomputed for data_idx (natural frequency order)
       uint16_t bar_color = precomputed_bar_colors[data_idx]; 
       
       if (h_int > 0) {

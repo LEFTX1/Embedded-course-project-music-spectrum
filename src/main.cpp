@@ -47,7 +47,7 @@ float vImag[FFT_SAMPLES_COUNT];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_SAMPLES_COUNT, (float)I2S_SAMPLE_RATE);
 
 // --- 频谱可视化参数 ---
-#define NUM_BANDS (PANEL_WIDTH / 2)
+#define NUM_BANDS (PANEL_WIDTH) // MODIFIED from (PANEL_WIDTH / 2)
 
 // --- 对数分桶参数 ---
 #define F_MIN_HZ 40.0f
@@ -444,18 +444,21 @@ void loop() {
   // Drawing to HUB75 panel
   if (dma_display) {
     dma_display->clearScreen();
-    int bar_width_ideal = PANEL_WIDTH / NUM_BANDS;
+    int bar_width_ideal = PANEL_WIDTH / NUM_BANDS; // This will now be 1
     if (bar_width_ideal < 1) bar_width_ideal = 1;
 
     for (int screen_band_idx = 0; screen_band_idx < NUM_BANDS; screen_band_idx++) {
-      int x = screen_band_idx * bar_width_ideal;
+      int x = screen_band_idx * bar_width_ideal; // x will be 0, 1, 2, ...
       // Data is processed from low freq (idx 0) to high freq (idx NUM_BANDS-1)
       // Display can be either left-to-right low-to-high, or reversed.
       // Current: screen_band_idx 0 (left) shows data_idx NUM_BANDS-1 (high freq)
       int data_idx = NUM_BANDS - 1 - screen_band_idx;
 
-      int current_bar_width = bar_width_ideal;
+      int current_bar_width = bar_width_ideal; // current_bar_width will be 1
       // Ensure no drawing outside panel if bar_width_ideal * NUM_BANDS > PANEL_WIDTH
+      // This check is still good practice, though with current_bar_width=1 and NUM_BANDS=PANEL_WIDTH,
+      // x + current_bar_width will not exceed PANEL_WIDTH until screen_band_idx = PANEL_WIDTH,
+      // but the loop runs up to NUM_BANDS-1 (which is PANEL_WIDTH-1).
       if (x + current_bar_width > PANEL_WIDTH) {
           current_bar_width = PANEL_WIDTH - x;
       }

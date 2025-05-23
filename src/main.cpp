@@ -47,14 +47,14 @@ float vImag[FFT_SAMPLES_COUNT];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_SAMPLES_COUNT, (float)I2S_SAMPLE_RATE);
 
 // --- 频谱可视化参数 ---
-#define NUM_BANDS (PANEL_WIDTH) // MODIFIED from (PANEL_WIDTH / 2)
+#define NUM_BANDS (PANEL_WIDTH) // MODIFIED for 1 pixel width per bar
 
-// --- 对数分桶参数 ---
+// --- 分桶参数 (Linear Binning) ---
 #define F_MIN_HZ 40.0f
 int band_start_bins[NUM_BANDS];
 int band_end_bins[NUM_BANDS];
 const float FREQ_RESOLUTION = (float)I2S_SAMPLE_RATE / FFT_SAMPLES_COUNT;
-const int USEFUL_FFT_BINS = FFT_SAMPLES_COUNT / 2;
+const int USEFUL_FFT_BINS = FFT_SAMPLES_COUNT / 2; // Number of magnitude bins from FFT (0 to N/2 - 1)
 
 // !! 校准参数 !!
 #define NOISE_FLOOR 26000.0f
@@ -92,9 +92,9 @@ float pow_lut_upper[POW_LUT_SIZE];
 
 
 // --- 调试开关 ---
-// #define DEBUG_SERIAL_LEVEL_1  // COMMENTED OUT to disable loop prints
-// #define DEBUG_SERIAL_LEVEL_2  // COMMENTED OUT
-#ifdef DEBUG_SERIAL_LEVEL_2 // This static var is only used if DEBUG_SERIAL_LEVEL_2 is defined (for setup prints)
+// #define DEBUG_SERIAL_LEVEL_1
+// #define DEBUG_SERIAL_LEVEL_2
+#ifdef DEBUG_SERIAL_LEVEL_2
 static unsigned long last_print_time_detail = 0;
 #endif
 
@@ -185,82 +185,112 @@ uint16_t hsv_to_panel_color(float h, float s, float v) {
     return 0;
 }
 
-void calculate_logarithmic_bins() {
-    Serial.println("--- Calculating Logarithmic Bins (v2) ---");
-    float max_freq_hz = (float)I2S_SAMPLE_RATE / 2.0f;
-    float min_possible_freq = FREQ_RESOLUTION;
-    float f_start_for_calc = max(F_MIN_HZ, min_possible_freq);
-    float log_min = log10f(f_start_for_calc);
-    float log_max = log10f(max_freq_hz);
-    float log_range = log_max - log_min;
+void calculate_frequency_bins() { // Changed name to be generic, implementing LINEAR binning
+  Serial.println("--- Calculating Linear Frequency Bins ---");
+  float min_possible_freq = FREQ_RESOLUTION; // Freq of FFT bin 1 (e.g., 16000/256 = 62.5 Hz)
+  float min_map_freq = max(F_MIN_HZ, min_possible_freq); // Actual lowest freq to start mapping from
+  float max_map_freq = (float)I2S_SAMPLE_RATE / 2.0f;    // Nyquist frequency (e.g., 16000/2 = 8000 Hz)
 
-    for (int i = 0; i < NUM_BANDS; i++) {
-        float band_log_low = log_min + ( (float)i / NUM_BANDS ) * log_range;
-        float band_log_high = log_min + ( (float)(i + 1) / NUM_BANDS ) * log_range;
-        float freq_low_ideal = pow10f(band_log_low);
-        float freq_high_ideal = pow10f(band_log_high);
-        int start_bin_ideal = roundf(freq_low_ideal / FREQ_RESOLUTION);
-        int end_bin_ideal = roundf(freq_high_ideal / FREQ_RESOLUTION) -1;
+  float total_freq_span_to_map = max_map_freq - min_map_freq;
 
-        if (i == 0) {
-            band_start_bins[i] = max(1, start_bin_ideal);
-        } else {
-            band_start_bins[i] = max(start_bin_ideal, band_end_bins[i-1] + 1);
-        }
-        band_end_bins[i] = max(band_start_bins[i], end_bin_ideal);
-        band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1);
-        band_end_bins[i] = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
+  if (total_freq_span_to_map <= 0.001f) { // Check for non-positive or tiny span
+      Serial.println("Error: Frequency span for binning is too small or invalid.");
+      // Fallback: Distribute FFT bins as evenly as possible among display bands
+      int bins_per_band = (USEFUL_FFT_BINS -1) / NUM_BANDS;
+      if (bins_per_band < 1) bins_per_band = 1;
+      for (int i = 0; i < NUM_BANDS; i++) {
+          band_start_bins[i] = max(1, 1 + i * bins_per_band);
+          band_end_bins[i] = max(1, band_start_bins[i] + bins_per_band - 1);
+          if (i == NUM_BANDS -1) band_end_bins[i] = USEFUL_FFT_BINS - 1; // Last band takes the rest
+          
+          band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1);
+          band_end_bins[i]   = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
+          if (band_end_bins[i] < band_start_bins[i]) band_end_bins[i] = band_start_bins[i];
+      }
+      Serial.println("Fallback binning applied.");
+      return;
+  }
 
-        if (band_start_bins[i] > band_end_bins[i]) {
-            band_end_bins[i] = band_start_bins[i];
-        }
-        if (i == NUM_BANDS - 1) {
-            band_end_bins[i] = USEFUL_FFT_BINS - 1;
-            if (band_start_bins[i] > band_end_bins[i]) {
-                 band_start_bins[i] = band_end_bins[i];
-            }
-        }
-        if (band_start_bins[i] >= USEFUL_FFT_BINS -1 && i < NUM_BANDS -1) {
-            for (int j = i; j < NUM_BANDS; ++j) {
-                band_start_bins[j] = USEFUL_FFT_BINS - 1;
-                band_end_bins[j] = USEFUL_FFT_BINS - 1;
-            }
-            break;
-        }
-        #ifdef DEBUG_SERIAL_LEVEL_2
+  float linear_freq_step_per_band = total_freq_span_to_map / NUM_BANDS;
+
+  for (int i = 0; i < NUM_BANDS; i++) {
+    float freq_low_ideal = min_map_freq + ((float)i * linear_freq_step_per_band);
+    float freq_high_ideal = min_map_freq + ((float)(i + 1) * linear_freq_step_per_band);
+    
+    int start_bin_ideal = roundf(freq_low_ideal / FREQ_RESOLUTION);
+    int end_bin_ideal = roundf(freq_high_ideal / FREQ_RESOLUTION) - 1;
+
+    if (i == 0) {
+      band_start_bins[i] = max(1, start_bin_ideal);
+    } else {
+      band_start_bins[i] = max(start_bin_ideal, band_end_bins[i - 1] + 1);
+    }
+    
+    band_end_bins[i] = max(band_start_bins[i], end_bin_ideal);
+    
+    band_start_bins[i] = constrain(band_start_bins[i], 1, USEFUL_FFT_BINS - 1);
+    band_end_bins[i] = constrain(band_end_bins[i], 1, USEFUL_FFT_BINS - 1);
+
+    if (band_start_bins[i] > band_end_bins[i]) {
+      band_end_bins[i] = band_start_bins[i];
+    }
+
+    if (i == NUM_BANDS - 1) {
+      band_end_bins[i] = USEFUL_FFT_BINS - 1;
+      if (band_start_bins[i] > band_end_bins[i]) {
+        band_start_bins[i] = band_end_bins[i];
+      }
+    }
+
+    if (band_start_bins[i] >= USEFUL_FFT_BINS - 1 && i < NUM_BANDS - 1) {
+      for (int j = i; j < NUM_BANDS; ++j) {
+        band_start_bins[j] = USEFUL_FFT_BINS - 1;
+        band_end_bins[j] = USEFUL_FFT_BINS - 1;
+      }
+      #ifdef DEBUG_SERIAL_LEVEL_2
+      Serial.printf("Band %2d onwards mapped to last FFT bin (%d).\n", i, USEFUL_FFT_BINS - 1);
+      #endif
+      break; 
+    }
+    
+    #ifdef DEBUG_SERIAL_LEVEL_2
+    if (millis() - last_print_time_detail > 50 || i < 5 || i > NUM_BANDS - 5) { // Print first/last few and occasionally
         Serial.printf("Band %2d: Freq_ideal %.0f-%.0f Hz => FFT Bins %3d-%3d (Len %d)\n",
                       i, freq_low_ideal, freq_high_ideal,
                       band_start_bins[i], band_end_bins[i], band_end_bins[i] - band_start_bins[i] + 1);
-        #endif
+        last_print_time_detail = millis();
     }
-    Serial.println("--- Adjusted Low Frequency Bins (First 5): ---");
-    for(int i=0; i < min(5, NUM_BANDS); ++i) {
-        float f_low_actual = band_start_bins[i] * FREQ_RESOLUTION;
-        float f_high_actual = (band_end_bins[i] + 1) * FREQ_RESOLUTION;
-         Serial.printf("  Adj Band %2d: FFT Bins %3d-%3d (Actual Freq ~%.0f-%.0f Hz)\n",
-                      i, band_start_bins[i], band_end_bins[i], f_low_actual, f_high_actual);
-    }
-    Serial.println("--- Logarithmic Bins Calculated (v2) ---");
+    #endif
+  }
+
+  Serial.println("--- Adjusted Low Frequency Bins (First 5 - Linear): ---");
+  for (int i = 0; i < min(5, NUM_BANDS); ++i) {
+    float f_low_actual = band_start_bins[i] * FREQ_RESOLUTION;
+    float f_high_actual = (band_end_bins[i] + 1) * FREQ_RESOLUTION;
+    Serial.printf("  Adj Band %2d: FFT Bins %3d-%3d (Actual Freq ~%.0f-%.0f Hz)\n",
+                  i, band_start_bins[i], band_end_bins[i], f_low_actual, f_high_actual);
+  }
+  Serial.println("--- Linear Frequency Bins Calculated ---");
 }
 
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(1000); // Wait for serial monitor
+  Serial.println("Starting setup...");
+
   setup_hub75_display();
   setup_i2s_microphone();
-  calculate_logarithmic_bins();
+  calculate_frequency_bins(); // This now calculates LINEAR bins
 
   // Precompute colors
   precomputed_peak_color = hsv_to_panel_color(0, 0.0f, 1.0f); // White
   for (int i = 0; i < NUM_BANDS; ++i) {
     float hue;
     if (NUM_BANDS > 1) {
-        // data_idx in drawing loop is NUM_BANDS - 1 - screen_band_idx
-        // Here, 'i' represents the data_idx (0 to NUM_BANDS-1) for spectrum natural order
         hue = ((float)i / (NUM_BANDS - 1)) * 240.0f; // Hue from Red (0) to Blue (240)
-    } else { // Avoid division by zero if NUM_BANDS is 1
-        hue = 0.0f; // Default hue for a single band (e.g., red)
+    } else { 
+        hue = 0.0f; 
     }
     precomputed_bar_colors[i] = hsv_to_panel_color(hue, 1.0f, 1.0f);
   }
@@ -279,11 +309,11 @@ void setup() {
     band_velocities[i] = 0.0f;
   }
 
-  Serial.println("Setup complete. Starting FFT Spectrum Display (Optimized).");
+  Serial.println("Setup complete. Starting FFT Spectrum Display (Linear Bins).");
   if (dma_display) {
       dma_display->clearScreen();
       dma_display->setCursor(1, 8);
-      dma_display->setTextColor(hsv_to_panel_color(120, 1, 1)); // Green for startup message
+      dma_display->setTextColor(hsv_to_panel_color(120, 1, 1)); 
       dma_display->print("Spectrum ON");
       dma_display->flipDMABuffer();
       delay(1500);
@@ -293,16 +323,14 @@ void setup() {
 
 void loop() {
   size_t bytes_actually_read = 0;
-  int32_t i2s_read_buff[FFT_SAMPLES_COUNT]; // Array size now 256
+  int32_t i2s_read_buff[FFT_SAMPLES_COUNT]; 
   const size_t buffer_size_in_bytes = FFT_SAMPLES_COUNT * sizeof(int32_t);
   esp_err_t result = i2s_read(I2S_PORT_NUM, (void*)i2s_read_buff, buffer_size_in_bytes, &bytes_actually_read, pdMS_TO_TICKS(100));
 
-  // All Serial prints in loop are disabled by commenting out DEBUG_SERIAL_LEVEL defines
-  // or by commenting out the print blocks directly.
 
   if (result == ESP_OK && bytes_actually_read == buffer_size_in_bytes) {
     for (int i = 0; i < FFT_SAMPLES_COUNT; i++) {
-      vReal[i] = (float)(i2s_read_buff[i] >> 8); // Extract 24 MSB from 32-bit sample
+      vReal[i] = (float)(i2s_read_buff[i] >> 8); 
       vImag[i] = 0.0f;
     }
 
@@ -315,13 +343,14 @@ void loop() {
         int start_bin = band_start_bins[band_idx];
         int end_bin = band_end_bins[band_idx];
 
-        if (start_bin >= USEFUL_FFT_BINS || end_bin < start_bin || start_bin == 0) {
-            // Keep band amplitude 0 or handle as appropriate
-            // This case should ideally be minimized by proper bin calculation
-        } else {
+        // This check is important: only process if the bin range is valid and non-empty
+        if (start_bin < USEFUL_FFT_BINS && end_bin >= start_bin && start_bin > 0) { // Ensure start_bin > 0
             for (int k = start_bin; k <= end_bin; k++) {
-                if (vReal[k] > max_amplitude_in_band) {
-                    max_amplitude_in_band = vReal[k];
+                 // Additional safety: ensure k is within vReal bounds, though 'constrain' should handle it.
+                if (k < FFT_SAMPLES_COUNT) { // Technically k < USEFUL_FFT_BINS is enough here.
+                    if (vReal[k] > max_amplitude_in_band) {
+                        max_amplitude_in_band = vReal[k];
+                    }
                 }
             }
         }
@@ -334,7 +363,7 @@ void loop() {
         }
 
         float normalized_amp = 0.0f;
-        if ((MAX_AMP_LOG - MIN_AMP_LOG) > 0.001f) { // Avoid division by zero
+        if ((MAX_AMP_LOG - MIN_AMP_LOG) > 0.001f) { 
            normalized_amp = (current_log_amp - MIN_AMP_LOG) / (MAX_AMP_LOG - MIN_AMP_LOG);
         }
         normalized_amp = constrain(normalized_amp * BAR_SENSITIVITY, 0.0f, 1.0f);
@@ -344,58 +373,53 @@ void loop() {
         float height_at_pivot = screen_max_pixels * HEIGHT_AT_PIVOT_FACTOR;
         
         if (normalized_amp <= NORM_AMP_PIVOT) {
-            if (NORM_AMP_PIVOT > 0.001f) { // Avoid division by zero
+            if (NORM_AMP_PIVOT > 0.001f) { 
                 float normalized_portion_below_pivot = normalized_amp / NORM_AMP_PIVOT;
-                // Use LUT for powf
                 int lut_index = constrain((int)(normalized_portion_below_pivot * (POW_LUT_SIZE - 1) + 0.5f), 0, POW_LUT_SIZE - 1);
                 float height_factor_below_pivot = pow_lut_lower[lut_index];
                 target_height = height_factor_below_pivot * height_at_pivot;
-            } else { // NORM_AMP_PIVOT is essentially zero
-                target_height = (normalized_amp > 0) ? height_at_pivot : 0.0f; // or just 0.0f if pivot is 0
+            } else { 
+                target_height = (normalized_amp > 0) ? height_at_pivot : 0.0f; 
             }
-        } else { // normalized_amp > NORM_AMP_PIVOT
+        } else { 
             float remaining_norm_amp_allowance = 1.0f - NORM_AMP_PIVOT;
             float remaining_height_to_fill = screen_max_pixels - height_at_pivot;
             if (remaining_norm_amp_allowance > 0.001f && remaining_height_to_fill > 0.001f) {
                 float normalized_excess = (normalized_amp - NORM_AMP_PIVOT) / remaining_norm_amp_allowance;
-                normalized_excess = constrain(normalized_excess, 0.0f, 1.0f); // Ensure it's within [0,1] for LUT
-                // Use LUT for powf
+                normalized_excess = constrain(normalized_excess, 0.0f, 1.0f); 
                 int lut_index = constrain((int)(normalized_excess * (POW_LUT_SIZE - 1) + 0.5f), 0, POW_LUT_SIZE - 1);
                 float additional_height_factor = pow_lut_upper[lut_index];
                 target_height = height_at_pivot + additional_height_factor * remaining_height_to_fill;
-            } else { // No room above pivot in normalization or height
-                target_height = height_at_pivot; // Default to pivot height
-                // If normalized_amp is very high, and pivot isn't max, allow full height
+            } else { 
+                target_height = height_at_pivot; 
                 if (normalized_amp >= 0.99f && NORM_AMP_PIVOT < 0.99f) { 
                     target_height = screen_max_pixels;
-                } else if (NORM_AMP_PIVOT >= 0.99f) { // Pivot is already at max norm_amp
-                     target_height = height_at_pivot; // (which should be screen_max_pixels)
+                } else if (NORM_AMP_PIVOT >= 0.99f) { 
+                     target_height = height_at_pivot; 
                 }
             }
         }
         target_height = constrain(target_height, 0.0f, screen_max_pixels);
 
-        // Bar physics (rise/fall)
         float current_actual_bar_h = band_heights[band_idx];
         float current_velocity = band_velocities[band_idx];
 
-        if (target_height >= current_actual_bar_h) { // Bar is rising or at target
+        if (target_height >= current_actual_bar_h) { 
              current_actual_bar_h = current_actual_bar_h * (1.0f - SMOOTHING_FACTOR_RISE) + target_height * SMOOTHING_FACTOR_RISE;
-            current_velocity = 0.0f; // Reset velocity on rise or meeting target
-        } else { // Bar is falling
+            current_velocity = 0.0f; 
+        } else { 
             current_velocity += GRAVITY_ACCELERATION;
             if (current_velocity > MAX_FALL_SPEED) current_velocity = MAX_FALL_SPEED;
-            // Ensure minimum fall speed if not already at target
-            if (current_velocity < INITIAL_FALL_VELOCITY && current_actual_bar_h > target_height + INITIAL_FALL_VELOCITY ) { // + INITIAL_FALL_VELOCITY to avoid micro-stuttering
+            if (current_velocity < INITIAL_FALL_VELOCITY && current_actual_bar_h > target_height + INITIAL_FALL_VELOCITY ) { 
                  current_velocity = INITIAL_FALL_VELOCITY;
              }
             current_actual_bar_h -= current_velocity;
-            if (current_actual_bar_h < target_height) { // Overshot target while falling
-                current_actual_bar_h = target_height;   // Snap to target
-                current_velocity = 0.0f;                 // Reset velocity
+            if (current_actual_bar_h < target_height) { 
+                current_actual_bar_h = target_height;   
+                current_velocity = 0.0f;                 
             }
         }
-        if (current_actual_bar_h <= 0.01f) { // Snap to zero if very small
+        if (current_actual_bar_h <= 0.01f) { 
             current_actual_bar_h = 0.0f;
             current_velocity = 0.0f;
         }
@@ -403,22 +427,19 @@ void loop() {
         band_velocities[band_idx] = current_velocity;
         band_heights[band_idx] = constrain(current_actual_bar_h, 0.0f, screen_max_pixels);
 
-        // Peak handling
-        if (band_heights[band_idx] >= peak_heights[band_idx] - 0.01f) { // If current height meets or exceeds peak
+        if (band_heights[band_idx] >= peak_heights[band_idx] - 0.01f) { 
             peak_heights[band_idx] = band_heights[band_idx];
-            peak_timers[band_idx] = millis(); // Reset peak timer
-        } else { // Current height is below peak, peak might fall
+            peak_timers[band_idx] = millis(); 
+        } else { 
             if (millis() - peak_timers[band_idx] > PEAK_FALL_DELAY) {
                 peak_heights[band_idx] = max(0.0f, peak_heights[band_idx] - PEAK_FALL_RATE_PIXELS_PER_FRAME);
             }
         }
-        // Ensure peak is never below current bar height
         if (peak_heights[band_idx] < band_heights[band_idx]) {
             peak_heights[band_idx] = band_heights[band_idx];
         }
     }
-  } else if (result == ESP_ERR_TIMEOUT) { // I2S read timeout
-     // Apply gravity to all bars if no new audio data
+  } else if (result == ESP_ERR_TIMEOUT) { 
      for (int i = 0; i < NUM_BANDS; i++) {
         float current_actual_bar_h = band_heights[i];
         float current_velocity = band_velocities[i];
@@ -429,42 +450,30 @@ void loop() {
         if (current_actual_bar_h <= 0.01f) { current_actual_bar_h = 0.0f; current_velocity = 0.0f; }
         band_velocities[i] = current_velocity;
         band_heights[i] = constrain(current_actual_bar_h, 0.0f, (float)(PANEL_HEIGHT - 1));
-        // Peaks also fall during timeout
         if (millis() - peak_timers[i] > PEAK_FALL_DELAY) { peak_heights[i] = max(0.0f, peak_heights[i] - PEAK_FALL_RATE_PIXELS_PER_FRAME);}
      }
-  } else { // I2S Read Error or incomplete read
-    // Optionally, print error to Serial here if really needed for debugging this specific case
-    // Serial.printf("I2S Read Error/Incomplete: %s, bytes_read: %u, expected: %u\n", esp_err_to_name(result), bytes_actually_read, buffer_size_in_bytes);
-    // Reset bars on error
+  } else { 
     for (int i = 0; i < NUM_BANDS; i++) {
         band_heights[i] = 0; peak_heights[i] = 0; band_velocities[i] = 0.0f;
     }
   }
 
-  // Drawing to HUB75 panel
   if (dma_display) {
     dma_display->clearScreen();
-    int bar_width_ideal = PANEL_WIDTH / NUM_BANDS; // This will now be 1
+    int bar_width_ideal = PANEL_WIDTH / NUM_BANDS; 
     if (bar_width_ideal < 1) bar_width_ideal = 1;
 
     for (int screen_band_idx = 0; screen_band_idx < NUM_BANDS; screen_band_idx++) {
-      int x = screen_band_idx * bar_width_ideal; // x will be 0, 1, 2, ...
-      // Data is processed from low freq (idx 0) to high freq (idx NUM_BANDS-1)
-      // Display can be either left-to-right low-to-high, or reversed.
-      // Current: screen_band_idx 0 (left) shows data_idx NUM_BANDS-1 (high freq)
+      int x = screen_band_idx * bar_width_ideal; 
       int data_idx = NUM_BANDS - 1 - screen_band_idx;
 
-      int current_bar_width = bar_width_ideal; // current_bar_width will be 1
-      // Ensure no drawing outside panel if bar_width_ideal * NUM_BANDS > PANEL_WIDTH
-      // This check is still good practice, though with current_bar_width=1 and NUM_BANDS=PANEL_WIDTH,
-      // x + current_bar_width will not exceed PANEL_WIDTH until screen_band_idx = PANEL_WIDTH,
-      // but the loop runs up to NUM_BANDS-1 (which is PANEL_WIDTH-1).
+      int current_bar_width = bar_width_ideal; 
       if (x + current_bar_width > PANEL_WIDTH) {
           current_bar_width = PANEL_WIDTH - x;
       }
       
       int h_int = (int)roundf(band_heights[data_idx]);
-      uint16_t bar_color = precomputed_bar_colors[data_idx]; // Use precomputed bar color
+      uint16_t bar_color = precomputed_bar_colors[data_idx]; 
       
       if (h_int > 0) {
         dma_display->fillRect(x, PANEL_HEIGHT - h_int, current_bar_width, h_int, bar_color);
@@ -472,10 +481,10 @@ void loop() {
 
       int peak_h_int = (int)roundf(peak_heights[data_idx]);
       if (peak_h_int > 0) {
-         uint16_t peak_color_to_use = precomputed_peak_color; // Use precomputed peak color
+         uint16_t peak_color_to_use = precomputed_peak_color; 
          
          int peak_y = PANEL_HEIGHT - 1 - peak_h_int;
-         peak_y = max(0, peak_y); // Constrain Y
+         peak_y = max(0, peak_y); 
          peak_y = min(peak_y, PANEL_HEIGHT -1);
 
          dma_display->drawFastHLine(x, peak_y, current_bar_width, peak_color_to_use);
@@ -483,5 +492,4 @@ void loop() {
     }
     dma_display->flipDMABuffer();
   }
-  // delay(0); // Already commented, good for responsiveness
 }

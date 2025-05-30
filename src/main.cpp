@@ -6,6 +6,12 @@
 #include <Wire.h>             // <<<<<<<<<<< 新增：包含 Wire 库
 #include "RevEng_PAJ7620.h" // <<<<<<<<<<< 新增：包含 PAJ7620 库头文件
 
+// --- WiFi ---
+#include <WiFi.h>
+#include <HTTPClient.h> // For OpenWeatherMap
+#include <ArduinoJson.h> // For OpenWeatherMap
+#include "time.h"       // For NTP time
+
 // --- HUB75 LED 屏幕参数配置 ---
 #define PANEL_WIDTH   64
 #define PANEL_HEIGHT  32
@@ -39,6 +45,40 @@ MatrixPanel_I2S_DMA *dma_display = nullptr;
 #define PAJ_SDA_PIN 6 // <<<<<<<<<<< 新增
 #define PAJ_SCL_PIN 7 // <<<<<<<<<<< 新增
 RevEng_PAJ7620 paj_sensor;  // <<<<<<<<<<< 新增：创建传感器对象
+
+// --- WiFi Credentials ---
+const char* WIFI_SSID = "areyouok";
+const char* WIFI_PASSWORD = "888888888";
+
+// --- OpenWeatherMap API ---
+const String OPENWEATHERMAP_API_KEY = "3ffe513ed138b2f60cfee3c72fb1c90c";
+const String OPENWEATHERMAP_CITY = "Tianjin";
+const String OPENWEATHERMAP_API_URL_BASE = "http://api.openweathermap.org/data/2.5/weather";
+
+// --- NTP Time ---
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET_SEC = 8 * 3600; // GMT+8 for Tianjin
+const int   DAYLIGHT_OFFSET_SEC = 0;
+struct tm timeinfo;
+char timeStringBuff[10]; // HH:MM:SS\0 or "No Time\0"
+
+// --- Application Modes ---
+enum AppMode {
+  SPECTRUM_MODE,
+  WEATHER_CLOCK_MODE
+};
+AppMode current_mode = SPECTRUM_MODE;
+bool mode_changed = true; // Flag to indicate mode has changed, for initial display update
+bool force_redraw_weather_clock = true; // 新增: 天气时钟模式强制刷新标志
+String last_displayed_time = ""; // 用于检测时间变化
+
+// --- Weather Data Store ---
+String weather_description = "Loading...";
+float temperature = 0.0;
+String weather_icon_code = ""; // e.g., "01d", "10n"
+unsigned long last_weather_update = 0;
+// Update weather every 15 minutes (15 * 60 * 1000 milliseconds)
+const unsigned long WEATHER_UPDATE_INTERVAL = 900000; 
 
 // --- I2S 和 FFT 配置参数 ---
 // ... (你现有的 FFT 和频谱参数保持不变) ...
@@ -94,6 +134,146 @@ static unsigned long last_print_time_detail = 0;
 
 // 函数原型 (如果你的 printGestureName 函数定义在 loop 之后)
 void printGestureName(Gesture gesture); // <<<<<<<<<<< 新增
+void setup_wifi();
+void fetch_weather_data();
+void update_time();
+void display_spectrum();
+void display_weather_clock();
+void draw_text_with_outline(int16_t x, int16_t y, const String& text, uint16_t text_color, uint16_t outline_color, uint8_t size, bool centerX);
+void handle_gesture_input();
+
+// >>>>>>>>>>>>>>>>>> START: 天气图标与绘制函数 <<<<<<<<<<<<<<<<<<
+// --- Icon Data (8x8, using RGB888, will be converted to 565) ---
+const uint32_t sun_8x8[] = {
+  0xFFFF00, 0x000000, 0x000000, 0xFFFF00, 0x000000, 0x000000, 0x000000, 0xFFFF00,
+  0x000000, 0xFFFF00, 0x000000, 0x000000, 0x000000, 0x000000, 0xFFFF00, 0x000000,
+  0x000000, 0x000000, 0x000000, 0xFFFF00, 0xFFFF00, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0xFFFF00, 0xFFFF00, 0xFFFF00, 0xFFFF00, 0x000000, 0xFFFF00,
+  0xFFFF00, 0x000000, 0xFFFF00, 0xFFFF00, 0xFFFF00, 0xFFFF00, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0xFFFF00, 0xFFFF00, 0x000000, 0x000000, 0x000000,
+  0x000000, 0xFFFF00, 0x000000, 0x000000, 0x000000, 0x000000, 0xFFFF00, 0x000000,
+  0xFFFF00, 0x000000, 0x000000, 0x000000, 0xFFFF00, 0x000000, 0x000000, 0xFFFF00,
+};
+// Cloud (using light blue for clouds)
+const uint32_t cloud_8x8[] = {
+  0x000000, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0x000000, 0x000000, 0x000000, 0x000000,
+  0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0x000000,
+  0xADD8E6, 0xADD8E6, 0xFFFFFF, 0xFFFFFF, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6,
+  0xADD8E6, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xADD8E6, 0xADD8E6, 0xADD8E6,
+  0xADD8E6, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xADD8E6, 0xADD8E6,
+  0x000000, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0x000000,
+  0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000,
+};
+const uint32_t showers_8x8[] = {
+  0x000000, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0x000000, 0x000000, 0x000000, 0x000000,
+  0xADD8E6, 0xADD8E6, 0xFFFFFF, 0xFFFFFF, 0xADD8E6, 0xADD8E6, 0xADD8E6, 0x000000,
+  0xADD8E6, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xADD8E6, 0x000000, 0xADD8E6,
+  0xADD8E6, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x0000FF, 0x000000, 0xADD8E6,
+  0xADD8E6, 0xADD8E6, 0xADD8E6, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0xADD8E6,
+  0x000000, 0xADD8E6, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000,
+  0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000,
+};
+const uint32_t rain_8x8[] = {
+  0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF,
+  0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000,
+  0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF,
+  0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000,
+  0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF,
+  0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000,
+  0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF,
+  0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000
+};
+const uint32_t storm_8x8[] = {
+  0x000000, 0x696969, 0x696969, 0x696969, 0x000000, 0x000000, 0x000000, 0x000000,
+  0x696969, 0xA9A9A9, 0xA9A9A9, 0xA9A9A9, 0x696969, 0x696969, 0x000000, 0x000000,
+  0x696969, 0xA9A9A9, 0xA9A9A9, 0x696969, 0x000000, 0xFFFF00, 0x000000, 0x000000,
+  0x000000, 0x696969, 0x000000, 0xFFFF00, 0xFFFF00, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0xFFFF00, 0xFFFF00, 0x000000, 0x696969, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0xFFFF00, 0x000000, 0x696969, 0x696969, 0x000000,
+  0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x0000FF, 0x000000, 0x0000FF, 0x000000, 0x000000, 0x000000,
+};
+const uint32_t snow_8x8[] = {
+  0x000000, 0xD3D3D3, 0xD3D3D3, 0xD3D3D3, 0x000000, 0x000000, 0x000000, 0x000000,
+  0xD3D3D3, 0xF5F5F5, 0xF5F5F5, 0xF5F5F5, 0xD3D3D3, 0xD3D3D3, 0x000000, 0x000000,
+  0xD3D3D3, 0xF5F5F5, 0xF5F5F5, 0xD3D3D3, 0xFFFFFF, 0x000000, 0xFFFFFF, 0x000000,
+  0x000000, 0xD3D3D3, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xD3D3D3, 0x000000, 0xFFFFFF,
+  0x000000, 0xFFFFFF, 0x000000, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0x000000,
+  0xFFFFFF, 0x000000, 0xFFFFFF, 0x000000, 0xD3D3D3, 0xFFFFFF, 0x000000, 0xFFFFFF,
+  0x000000, 0xFFFFFF, 0x000000, 0xFFFFFF, 0x000000, 0xFFFFFF, 0xFFFFFF, 0x000000,
+  0xFFFFFF, 0x000000, 0xFFFFFF, 0x000000, 0xFFFFFF, 0x000000, 0xFFFFFF, 0xFFFFFF,
+};
+const uint32_t unknown_weather_8x8[] = {
+  0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000,
+  0x000000, 0xFFFFFF, 0x000000, 0x000000, 0x000000, 0x000000, 0xFFFFFF, 0x000000,
+  0x000000, 0xFFFFFF, 0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000, 0x000000,
+  0x000000, 0x000000, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000,
+};
+uint16_t color565(uint32_t rgb) {
+  return (((rgb >> 16) & 0xF8) << 8) |
+         (((rgb >> 8) & 0xFC) << 3) |
+         ((rgb & 0xFF) >> 3);
+};
+void drawWeatherBitmap(int startx, int starty, int width, int height, const uint32_t *bitmap) {
+  if (!dma_display) return;
+  int counter = 0;
+  for (int yy = 0; yy < height; yy++) {
+    for (int xx = 0; xx < width; xx++) {
+      dma_display->drawPixel(startx + xx, starty + yy, color565(bitmap[counter]));
+      counter++;
+    }
+  }
+}
+void drawWeatherBitmap(int startx, int starty, int width, int height, const uint32_t *bitmap, bool enlarged) {
+  if (!dma_display) return;
+  int counter = 0;
+  if (enlarged) {
+    for (int yy = 0; yy < height; yy++) {
+      for (int xx = 0; xx < width; xx++) {
+        uint16_t pixel_color = color565(bitmap[counter]);
+        dma_display->drawPixel(startx + 2 * xx, starty + 2 * yy, pixel_color);
+        dma_display->drawPixel(startx + 2 * xx + 1, starty + 2 * yy, pixel_color);
+        dma_display->drawPixel(startx + 2 * xx, starty + 2 * yy + 1, pixel_color);
+        dma_display->drawPixel(startx + 2 * xx + 1, starty + 2 * yy + 1, pixel_color);
+        counter++;
+      }
+    }
+  } else {
+    drawWeatherBitmap(startx, starty, width, height, bitmap);
+  }
+}
+void drawWeatherIcon(int startx, int starty, int width, int height, uint8_t icon_idx, bool enlarged) {
+  const uint32_t* icon_data_ptr;
+  switch (icon_idx) {
+    case 0: icon_data_ptr = sun_8x8; break;
+    case 1: icon_data_ptr = cloud_8x8; break;
+    case 2: icon_data_ptr = showers_8x8; break;
+    case 3: icon_data_ptr = rain_8x8; break;
+    case 4: icon_data_ptr = storm_8x8; break;
+    case 5: icon_data_ptr = snow_8x8; break;
+    default: icon_data_ptr = unknown_weather_8x8; break;
+  }
+  drawWeatherBitmap(startx, starty, width, height, icon_data_ptr, enlarged);
+}
+int mapOwmIconToInternal(String owmIcon) {
+    if (owmIcon.startsWith("01")) return 0; // 晴天
+    if (owmIcon.startsWith("02")) return 1; // 少云
+    if (owmIcon.startsWith("03")) return 1; // 散云
+    if (owmIcon.startsWith("04")) return 1; // 阴天
+    if (owmIcon.startsWith("09")) return 2; // 阵雨
+    if (owmIcon.startsWith("10")) return 3; // 雨
+    if (owmIcon.startsWith("11")) return 4; // 雷暴
+    if (owmIcon.startsWith("13")) return 5; // 雪
+    if (owmIcon.startsWith("50")) return 1; // 雾
+    return 6; // 未知
+}
+// >>>>>>>>>>>>>>>>>> END: 天气图标与绘制函数 <<<<<<<<<<<<<<<<<<
 
 void setup_hub75_display() {
   HUB75_I2S_CFG::i2s_pins _pins = {
@@ -170,6 +350,31 @@ void setup_paj7620_sensor() {
   }
 }
 
+void setup_wifi() {
+  Serial.println("--- Connecting to WiFi ---");
+  Serial.printf("SSID: %s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Try for 10 seconds
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    // Initialize NTP
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    update_time(); // Get initial time
+    fetch_weather_data(); // Get initial weather
+  } else {
+    Serial.println("\nWiFi connection FAILED!");
+    strcpy(timeStringBuff, "No WiFi");
+    weather_description = "No WiFi";
+  }
+}
 
 uint16_t hsv_to_panel_color(float h, float s, float v) {
     // ... (你现有的 hsv_to_panel_color 函数保持不变) ...
@@ -338,6 +543,7 @@ void setup() {
   setup_hub75_display();
   setup_i2s_microphone();
   setup_paj7620_sensor(); // <<<<<<<<<<< 新增：调用手势传感器初始化
+  setup_wifi(); // Connect to WiFi and initialize NTP
 
   calculate_linear_bins();
 
@@ -360,63 +566,151 @@ void setup() {
     band_velocities[i] = 0.0f;
   }
 
-  Serial.println("Setup complete. Starting FFT Spectrum Display with Gesture Control.");
-  if (dma_display) {
-      dma_display->clearScreen();
-      dma_display->setCursor(1, 1); // 调整位置
-      dma_display->setTextSize(1);
-      dma_display->setTextColor(hsv_to_panel_color(120, 1, 1));
-      dma_display->print("Spectrum ON");
-      dma_display->setCursor(1, 10);
-      dma_display->print("Gesture ON");
-      dma_display->flipDMABuffer();
-      delay(2000); // 延长显示时间
-  }
+  Serial.println("Setup complete. Initial mode: Spectrum Display.");
+  current_mode = SPECTRUM_MODE; // Explicitly set initial mode
+  mode_changed = true; // Trigger initial display update for the mode
 }
 
-// <<<<<<<<<<< 新增：处理手势并在屏幕上画圆的函数
-void handle_gesture_and_draw() {
+void handle_gesture_input() {
     Gesture gesture = paj_sensor.readGesture();
+    bool mode_switched_this_cycle = false;
 
-    if (gesture == GES_CLOCKWISE || gesture == GES_ANTICLOCKWISE) {
-        Serial.print("Gesture detected: ");
-        printGestureName(gesture); // 打印手势名称到串口
-
-        if (dma_display) {
-            dma_display->clearScreen(); // 清除屏幕以便画圆
-            // 在屏幕中心画一个圆
-            int centerX = PANEL_WIDTH / 2;
-            int centerY = PANEL_HEIGHT / 2;
-            int radius = min(centerX, centerY) - 2; // 半径，留出一些边距
-            uint16_t circleColor = hsv_to_panel_color(random(0,360), 1.0f, 1.0f); // 随机颜色
-
-            dma_display->drawCircle(centerX, centerY, radius, circleColor);
-            dma_display->flipDMABuffer();
-            delay(1000); // 显示圆圈1秒钟
-            // dma_display->clearScreen(); // 清除圆圈，准备下一次绘制频谱（或者在频谱绘制前清除）
+    if (gesture == GES_RIGHT) {
+        if (current_mode != WEATHER_CLOCK_MODE) {
+            Serial.println("Gesture: RIGHT - Switching to Weather/Clock mode");
+            current_mode = WEATHER_CLOCK_MODE;
+            mode_changed = true; 
+            force_redraw_weather_clock = true; 
+            mode_switched_this_cycle = true;
         }
-    } else if (gesture != GES_NONE) {
+    } else if (gesture == GES_LEFT) {
+        if (current_mode != SPECTRUM_MODE) {
+            Serial.println("Gesture: LEFT - Switching to Spectrum mode");
+            current_mode = SPECTRUM_MODE;
+            mode_changed = true;
+            mode_switched_this_cycle = true;
+        }
+    } else if (gesture != GES_NONE && gesture != GES_WAVE && gesture != GES_CLOCKWISE && gesture != GES_ANTICLOCKWISE) { 
         Serial.print("Gesture detected: ");
-        printGestureName(gesture); // 打印其他手势名称
-        // 这里可以为其他手势添加不同的屏幕反馈
+        printGestureName(gesture);
+    }
+
+    if (mode_switched_this_cycle && dma_display) {
+        dma_display->clearScreen();
+        String mode_text = (current_mode == WEATHER_CLOCK_MODE) ? "Weather" : "Spectrum";
+        uint16_t text_color = (current_mode == WEATHER_CLOCK_MODE) ? hsv_to_panel_color(120,1,1) : hsv_to_panel_color(200,1,1); 
+        dma_display->setTextSize(1);
+        dma_display->setTextColor(text_color);
+        int16_t x1, y1; uint16_t w, h;
+        dma_display->getTextBounds(mode_text, 0, 0, &x1, &y1, &w, &h);
+        dma_display->setCursor((PANEL_WIDTH - w) / 2, (PANEL_HEIGHT - h) / 2);
+        dma_display->print(mode_text);
+        dma_display->flipDMABuffer();
+        delay(1000); 
     }
 }
 
+void update_time() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!getLocalTime(&timeinfo)) {
+      Serial.println("Failed to obtain time");
+      strcpy(timeStringBuff, "No Time");
+      return;
+    }
+    sprintf(timeStringBuff, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    // Avoid overwriting if it was already "No WiFi" from setup
+    if (strcmp(timeStringBuff, "No WiFi") != 0) {
+        strcpy(timeStringBuff, "No Time");
+    }
+  }
+}
 
-void loop() {
-  // <<<<<<<<<<< 新增：处理手势输入
-  handle_gesture_and_draw();
+void fetch_weather_data() {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        String url = OPENWEATHERMAP_API_URL_BASE + "?q=" + OPENWEATHERMAP_CITY +
+                     "&appid=" + OPENWEATHERMAP_API_KEY + "&units=metric&lang=zh_cn"; 
+        
+        Serial.print("Fetching weather data from: "); Serial.println(url);
+        http.begin(url);
+        int httpCode = http.GET();
 
-  // --- 原有的频谱分析和显示逻辑 ---
+        if (httpCode > 0) {
+            if (httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                DynamicJsonDocument doc(1024); 
+                DeserializationError error = deserializeJson(doc, payload);
+
+                if (error) {
+                    Serial.print(F("deserializeJson() failed: "));
+                    Serial.println(error.f_str());
+                    weather_description = "JSON Err";
+                    return;
+                }
+
+                JsonObject weather_0 = doc["weather"][0];
+                String raw_desc = weather_0["description"].as<String>(); // 获取原始中文描述
+                weather_icon_code = weather_0["icon"].as<String>();
+                
+                JsonObject main = doc["main"];
+                temperature = main["temp"].as<float>();
+
+                Serial.println("Raw weather_description from API: " + raw_desc);
+
+                // --- 中文到英文的映射 --- 
+                String display_desc = raw_desc; // 默认为原始描述，以防没有匹配
+                if (raw_desc == "晴") {
+                    display_desc = "Sunny";
+                } else if (raw_desc == "多云") {
+                    display_desc = "Cloudy";
+                } else if (raw_desc == "少云" || raw_desc == "晴间多云") {
+                    display_desc = "P Cloudy"; // Partly Cloudy
+                } else if (raw_desc == "阴") {
+                    display_desc = "Overcast";
+                } else if (raw_desc.indexOf("雨") != -1) { // 包含"雨"字
+                    if (raw_desc.indexOf("雷") != -1) display_desc = "T-Storm"; // Thunderstorm
+                    else if (raw_desc.indexOf("小") != -1) display_desc = "L Rain"; // Light Rain
+                    else if (raw_desc.indexOf("中") != -1) display_desc = "M Rain"; // Moderate Rain
+                    else if (raw_desc.indexOf("大") != -1) display_desc = "H Rain"; // Heavy Rain
+                    else display_desc = "Rain";
+                } else if (raw_desc.indexOf("雪") != -1) { // 包含"雪"字
+                    display_desc = "Snow";
+                } else if (raw_desc == "薄雾" || raw_desc == "雾") {
+                    display_desc = "Mist";
+                } else if (raw_desc == "霾") {
+                    display_desc = "Haze";
+                }
+                // 更新全局变量
+                weather_description = display_desc;
+
+                Serial.printf("Mapped Weather: %s, Temp: %.1fC, Icon: %s\n", weather_description.c_str(), temperature, weather_icon_code.c_str());
+                last_weather_update = millis(); 
+
+            } else {
+                Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+                weather_description = "HTTP Err";
+            }
+        } else {
+            Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+            weather_description = "Connect Err";
+        }
+        http.end();
+    } else {
+        Serial.println("WiFi not connected. Cannot fetch weather.");
+        weather_description = "No WiFi";
+    }
+}
+
+void display_spectrum() {
   size_t bytes_actually_read = 0;
   int32_t i2s_read_buff[FFT_SAMPLES_COUNT];
   const size_t buffer_size_in_bytes = FFT_SAMPLES_COUNT * sizeof(int32_t);
-  esp_err_t result = i2s_read(I2S_PORT_NUM, (void*)i2s_read_buff, buffer_size_in_bytes, &bytes_actually_read, pdMS_TO_TICKS(100));
+  esp_err_t result = i2s_read(I2S_PORT_NUM, (void*)i2s_read_buff, buffer_size_in_bytes, &bytes_actually_read, pdMS_TO_TICKS(30));
 
   if (result == ESP_OK && bytes_actually_read == buffer_size_in_bytes) {
-    // ... (FFT 处理逻辑保持不变) ...
     for (int i = 0; i < FFT_SAMPLES_COUNT; i++) {
-      vReal[i] = (float)(i2s_read_buff[i] >> 8);
+      vReal[i] = (float)(i2s_read_buff[i] >> 8); 
       vImag[i] = 0.0f;
     }
     FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
@@ -427,11 +721,13 @@ void loop() {
         float max_amplitude_in_band = 0.0f;
         int start_bin = band_start_bins[band_idx];
         int end_bin = band_end_bins[band_idx];
-        if (start_bin < USEFUL_FFT_BINS && end_bin >= start_bin && start_bin > 0) {
+        if (start_bin > 0 && start_bin < USEFUL_FFT_BINS && end_bin >= start_bin && end_bin < USEFUL_FFT_BINS) { 
             for (int k = start_bin; k <= end_bin; k++) {
-                if (k < USEFUL_FFT_BINS) {
-                    if (vReal[k] > max_amplitude_in_band) {
-                        max_amplitude_in_band = vReal[k]; }}}}
+                 if (vReal[k] > max_amplitude_in_band) {
+                    max_amplitude_in_band = vReal[k]; 
+                 }
+            }
+        }
         float representative_amplitude = max_amplitude_in_band;
         float current_log_amp = 0.0f;
         if (representative_amplitude > NOISE_FLOOR) {
@@ -450,7 +746,7 @@ void loop() {
                 int lut_index = constrain((int)(normalized_portion_below_pivot * (POW_LUT_SIZE - 1) + 0.5f), 0, POW_LUT_SIZE - 1);
                 float height_factor_below_pivot = pow_lut_lower[lut_index];
                 target_height = height_factor_below_pivot * height_at_pivot;
-            } else { target_height = (normalized_amp > 0) ? height_at_pivot : 0.0f; }}
+            } else { target_height = (normalized_amp > 0.001f) ? height_at_pivot : 0.0f; }}
         else {
             float remaining_norm_amp_allowance = 1.0f - NORM_AMP_PIVOT;
             float remaining_height_to_fill = screen_max_pixels - height_at_pivot;
@@ -460,10 +756,15 @@ void loop() {
                 int lut_index = constrain((int)(normalized_excess * (POW_LUT_SIZE - 1) + 0.5f), 0, POW_LUT_SIZE - 1);
                 float additional_height_factor = pow_lut_upper[lut_index];
                 target_height = height_at_pivot + additional_height_factor * remaining_height_to_fill;
-            } else {
+            } else { 
                 target_height = height_at_pivot;
-                if (normalized_amp >= 0.99f && NORM_AMP_PIVOT < 0.99f) { target_height = screen_max_pixels;
-                } else if (NORM_AMP_PIVOT >= 0.99f) { target_height = height_at_pivot; }}}
+                if (normalized_amp >= 0.99f && NORM_AMP_PIVOT < 0.99f) { 
+                     target_height = screen_max_pixels;
+                } else if (NORM_AMP_PIVOT >= 0.99f) { 
+                     target_height = height_at_pivot; 
+                }
+            }
+        }
         target_height = constrain(target_height, 0.0f, screen_max_pixels);
         float current_actual_bar_h = band_heights[band_idx];
         float current_velocity = band_velocities[band_idx];
@@ -490,56 +791,219 @@ void loop() {
         else {
             if (millis() - peak_timers[band_idx] > PEAK_FALL_DELAY) {
                 peak_heights[band_idx] = max(0.0f, peak_heights[band_idx] - PEAK_FALL_RATE_PIXELS_PER_FRAME);}}
-        if (peak_heights[band_idx] < band_heights[band_idx]) {
+        if (peak_heights[band_idx] < band_heights[band_idx]) { 
             peak_heights[band_idx] = band_heights[band_idx]; }
     }
-  } else if (result == ESP_ERR_TIMEOUT) {
+  } else if (result == ESP_ERR_TIMEOUT || bytes_actually_read == 0) { 
      for (int i = 0; i < NUM_BANDS; i++) {
         float current_actual_bar_h = band_heights[i];
         float current_velocity = band_velocities[i];
         current_velocity += GRAVITY_ACCELERATION;
         if (current_velocity > MAX_FALL_SPEED) current_velocity = MAX_FALL_SPEED;
-        if (current_velocity < INITIAL_FALL_VELOCITY && current_actual_bar_h > INITIAL_FALL_VELOCITY ) current_velocity = INITIAL_FALL_VELOCITY;
+        if (current_actual_bar_h > 0.01f && current_velocity < INITIAL_FALL_VELOCITY) current_velocity = INITIAL_FALL_VELOCITY;
         current_actual_bar_h -= current_velocity;
         if (current_actual_bar_h <= 0.01f) { current_actual_bar_h = 0.0f; current_velocity = 0.0f; }
         band_velocities[i] = current_velocity;
         band_heights[i] = constrain(current_actual_bar_h, 0.0f, (float)(PANEL_HEIGHT - 1));
-        if (millis() - peak_timers[i] > PEAK_FALL_DELAY) { peak_heights[i] = max(0.0f, peak_heights[i] - PEAK_FALL_RATE_PIXELS_PER_FRAME);}}
-  } else {
-    for (int i = 0; i < NUM_BANDS; i++) {
-        band_heights[i] = 0; peak_heights[i] = 0; band_velocities[i] = 0.0f;
+        if (millis() - peak_timers[i] > PEAK_FALL_DELAY) { 
+            peak_heights[i] = max(0.0f, peak_heights[i] - PEAK_FALL_RATE_PIXELS_PER_FRAME);
+        }
+         if (peak_heights[i] < band_heights[i]) peak_heights[i] = band_heights[i]; 
+     }
+  } else { 
+    Serial.printf("I2S Read Error: %d\n", result);
+    for (int i = 0; i < NUM_BANDS; i++) { 
+        band_heights[i] *= 0.8; peak_heights[i] *= 0.8; 
+        if (band_heights[i] < 0.1) band_heights[i] = 0;
+        if (peak_heights[i] < 0.1) peak_heights[i] = 0;
+        band_velocities[i] = 0.0f;
     }
   }
 
   if (dma_display) {
-    dma_display->clearScreen(); // 清除屏幕，准备绘制频谱
+    dma_display->clearScreen();
+
     int bar_width_ideal = PANEL_WIDTH / NUM_BANDS;
     if (bar_width_ideal < 1) bar_width_ideal = 1;
 
     for (int screen_band_idx = 0; screen_band_idx < NUM_BANDS; screen_band_idx++) {
-      // ... (频谱绘制逻辑保持不变) ...
       int x = screen_band_idx * bar_width_ideal;
-      int data_idx = NUM_BANDS - 1 - screen_band_idx;
+      int data_idx = NUM_BANDS - 1 - screen_band_idx; 
       int current_bar_width = bar_width_ideal;
       if (x + current_bar_width > PANEL_WIDTH) {
           current_bar_width = PANEL_WIDTH - x; }
+      if (current_bar_width <= 0) continue; 
+
       int h_int = (int)roundf(band_heights[data_idx]);
       uint16_t bar_color = precomputed_bar_colors[data_idx];
       if (h_int > 0) {
         dma_display->fillRect(x, PANEL_HEIGHT - h_int, current_bar_width, h_int, bar_color); }
+      
       int peak_h_int = (int)roundf(peak_heights[data_idx]);
-      if (peak_h_int > 0) {
+      if (peak_h_int > 0 && peak_h_int >= h_int) { 
          uint16_t peak_color_to_use = precomputed_peak_color;
          int peak_y = PANEL_HEIGHT - 1 - peak_h_int;
-         peak_y = max(0, peak_y);
+         peak_y = max(0, peak_y); 
          peak_y = min(peak_y, PANEL_HEIGHT -1);
-         dma_display->drawFastHLine(x, peak_y, current_bar_width, peak_color_to_use); }
+         dma_display->drawFastHLine(x, peak_y, current_bar_width, peak_color_to_use); 
+      }
     }
     dma_display->flipDMABuffer();
   }
 }
 
-// <<<<<<<<<<< 新增：打印手势名称的辅助函数 (与之前的测试代码类似)
+// 新增：分区大号时钟显示，主时钟只显示HH:MM，秒数单独小号显示
+void draw_bold_clock(int16_t x, int16_t y, const String& time_str, uint16_t text_color, uint16_t outline_color, uint8_t size) {
+    for (int8_t dx = -1; dx <= 1; dx++) {
+        for (int8_t dy = -1; dy <= 1; dy++) {
+            if (dx != 0 || dy != 0) {
+                dma_display->setTextColor(outline_color);
+                dma_display->setCursor(x + dx, y + dy);
+                dma_display->setTextSize(size);
+                dma_display->print(time_str);
+            }
+        }
+    }
+    dma_display->setTextColor(text_color);
+    dma_display->setCursor(x, y);
+    dma_display->setTextSize(size);
+    dma_display->print(time_str);
+}
+
+void display_weather_clock() {
+    bool needs_display_update = force_redraw_weather_clock; 
+    force_redraw_weather_clock = false; 
+
+    static unsigned long last_ntp_sync_attempt = 0;
+    static unsigned long last_weather_api_call_attempt = 0;
+    static String last_hhmm = "";
+    static String last_ss = "";
+    static unsigned long fade_anim_start = 0;
+    const unsigned long fade_anim_ms = 400;
+    static String last_minute = "";
+
+    // 更新时间字符串
+    if (millis() - last_ntp_sync_attempt > 950) { 
+        update_time();
+        last_ntp_sync_attempt = millis();
+    }
+
+    // 获取天气数据
+    bool weather_data_seems_stale = (weather_icon_code == "" || weather_icon_code == "Loading...");
+    if (WiFi.status() == WL_CONNECTED && (millis() - last_weather_api_call_attempt > WEATHER_UPDATE_INTERVAL || weather_data_seems_stale) ) {
+        fetch_weather_data(); 
+        last_weather_api_call_attempt = millis(); 
+        needs_display_update = true; 
+    }
+
+    // 拆分时分秒
+    String cur_time = String(timeStringBuff);
+    String cur_hhmm = cur_time.substring(0,5); // HH:MM
+    String cur_ss = cur_time.length() >= 8 ? cur_time.substring(6,8) : "00";
+    String cur_minute = cur_time.substring(3,5); // MM
+
+    // 检测分钟变化，触发动画
+    if (last_minute != cur_minute) {
+        fade_anim_start = millis();
+        last_minute = cur_minute;
+    }
+
+    // 只要时分或强制刷新变化就全屏重绘，否则只重绘秒区
+    if (last_hhmm != cur_hhmm || needs_display_update) {
+        last_hhmm = cur_hhmm;
+        last_ss = cur_ss;
+    dma_display->clearScreen(); 
+    dma_display->setTextWrap(false);
+
+        // 主时钟渐变亮度动画
+        float fade_v = 1.0f;
+        if (fade_anim_start > 0) {
+            unsigned long anim_elapsed = millis() - fade_anim_start;
+            if (anim_elapsed < fade_anim_ms) {
+                fade_v = 0.8f + 0.2f * (float(anim_elapsed) / fade_anim_ms);
+            } else {
+                fade_anim_start = 0;
+                fade_v = 1.0f;
+            }
+        }
+        uint16_t time_color = hsv_to_panel_color(200, 1, fade_v);
+        uint16_t outline_color = hsv_to_panel_color(0, 0, 0.2);
+        uint8_t clock_size = 2;
+        int16_t x1, y1; uint16_t w, h;
+        dma_display->setTextSize(clock_size);
+        dma_display->getTextBounds(cur_hhmm, 0, 0, &x1, &y1, &w, &h);
+        int16_t clock_x = (PANEL_WIDTH - w) / 2;
+        int16_t clock_y = 0 + 3;
+        draw_bold_clock(clock_x, clock_y, cur_hhmm, time_color, outline_color, clock_size);
+        // 温度
+    String temp_num_str = String(temperature, 0);
+    uint16_t temp_color = hsv_to_panel_color(60,1,1);
+    dma_display->setTextColor(temp_color);
+    dma_display->setTextSize(1);
+    int16_t x1_temp_num, y1_temp_num; uint16_t w_temp_num, h_temp_num;
+    dma_display->getTextBounds(temp_num_str, 0, 0, &x1_temp_num, &y1_temp_num, &w_temp_num, &h_temp_num);
+        uint8_t degree_radius = 1;
+        uint8_t spacing_after_num = 1;
+        uint8_t spacing_after_degree = 1;
+    int16_t x1_c, y1_c; uint16_t w_c, h_c;
+    dma_display->getTextBounds("C", 0, 0, &x1_c, &y1_c, &w_c, &h_c);
+    int16_t temp_y_baseline = PANEL_HEIGHT - h_temp_num - 2;
+        int16_t temp_start_x = 4;
+    dma_display->setCursor(temp_start_x, temp_y_baseline);
+    dma_display->print(temp_num_str);
+        int16_t circle_cx = temp_start_x + w_temp_num + spacing_after_num + degree_radius;
+        int16_t circle_cy = temp_y_baseline + degree_radius -1;
+        dma_display->drawCircle(circle_cx, circle_cy, degree_radius, temp_color);
+        dma_display->drawCircle(circle_cx, circle_cy, degree_radius-1, temp_color);
+        dma_display->setCursor(circle_cx + degree_radius + spacing_after_degree, temp_y_baseline);
+    dma_display->print("C");
+        // 秒区先用黑色块覆盖
+        dma_display->fillRect(PANEL_WIDTH-18, PANEL_HEIGHT-14, 18, 14, 0);
+        // 天气图标 8x8，放在屏幕中下方，右下角往左25格，往上一格，保证完全可见且不与秒区重叠
+        int icon_disp_width = 8;
+        int icon_disp_height = 8;
+        int internal_icon_idx = mapOwmIconToInternal(weather_icon_code);
+        int icon_y_start = (PANEL_HEIGHT / 2) + ((PANEL_HEIGHT / 2) - icon_disp_height) - 2 - 1; // 再往上一格
+        int icon_x_start = PANEL_WIDTH - icon_disp_width - 22 - 3; // 再往左三格
+        drawWeatherIcon(icon_x_start, icon_y_start, 8, 8, internal_icon_idx, false);
+    }
+    // 秒数变化时只重绘右下角
+    if (last_ss != cur_ss) {
+        last_ss = cur_ss;
+        // 覆盖秒区
+        dma_display->fillRect(PANEL_WIDTH-18, PANEL_HEIGHT-14, 18, 14, 0);
+        // 小号加粗秒数，整体向上移动1格
+        uint16_t sec_color = hsv_to_panel_color(0,0,1);
+        uint16_t sec_outline = hsv_to_panel_color(0,0,0.2);
+        uint8_t sec_size = 1;
+        int16_t x1s, y1s; uint16_t ws, hs;
+        dma_display->setTextSize(sec_size);
+        dma_display->getTextBounds(cur_ss, 0, 0, &x1s, &y1s, &ws, &hs);
+        int16_t sec_x = PANEL_WIDTH - ws - 4;
+        int16_t sec_y = PANEL_HEIGHT - hs - 3; // 向上移动1格
+        draw_bold_clock(sec_x, sec_y, cur_ss, sec_color, sec_outline, sec_size);
+    }
+    dma_display->flipDMABuffer();
+}
+
+void loop() {
+  if (!dma_display) return;
+
+  handle_gesture_input(); 
+
+  if (current_mode == SPECTRUM_MODE) {
+    if (mode_changed) {
+        Serial.println("Spectrum display active.");
+        mode_changed = false;
+    }
+    display_spectrum(); 
+
+  } else if (current_mode == WEATHER_CLOCK_MODE) {
+    display_weather_clock(); 
+    dma_display->flipDMABuffer(); // 天气时钟模式仍然在这里翻转，因为它自己按需绘制
+  }
+}
+
 void printGestureName(Gesture gesture) {
   switch (gesture) {
     case GES_UP: Serial.println("UP (上)"); break;

@@ -4,6 +4,7 @@
 #include <ArduinoFFT.h>
 #include <math.h>
 #include <Wire.h>             // <<<<<<<<<<< 新增：包含 Wire 库
+#include "esp_mac.h"          // 修复：根据ESP-IDF提示，手动包含
 #include "RevEng_PAJ7620.h" // <<<<<<<<<<< 新增：包含 PAJ7620 库头文件
 // 添加最小字体头文件
 #include <Fonts/Tiny3x3a2pt7b.h>
@@ -18,6 +19,66 @@
 #include <WebServer.h>  // 新增：Web服务器
 #include <SPIFFS.h>     // 新增：文件系统
 #include <WebSocketsServer.h> // 新增：WebSocket服务器
+
+// --- BLE Media Control ---
+#include <NimBLEDevice.h>
+#include <NimBLEServer.h>
+#include <NimBLEUtils.h>
+#include <NimBLEHIDDevice.h>
+
+// BLE HID Report Descriptor for a Consumer Control device (media keys)
+static const uint8_t hid_report_descriptor[] = {
+    0x05, 0x0C,        // Usage Page (Consumer)
+    0x09, 0x01,        // Usage (Consumer Control)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x01,        //   Report ID (1)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x2A, 0x3C, 0x02,  //   Usage Maximum (0x23C)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0x3C, 0x02,  //   Logical Maximum (0x23C)
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x10,        //   Report Size (16)
+    0x81, 0x00,        //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+    0xC0               // End Collection
+};
+
+// --- Standard HID Consumer Control Codes ---
+#define HID_CONSUMER_PLAY_PAUSE 0xCD
+#define HID_CONSUMER_STOP       0xB7
+#define HID_CONSUMER_NEXT_TRACK 0xB5
+#define HID_CONSUMER_PREV_TRACK 0xB6
+
+bool ble_connected = false;
+NimBLEHIDDevice* hid;
+NimBLECharacteristic* input_consumer_control;
+
+// 新增：手势处理冷却时间
+unsigned long last_gesture_time = 0;
+const unsigned long GESTURE_COOLDOWN_MS = 500; // 500ms的冷却时间
+
+class ServerCallbacks: public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+        ble_connected = true;
+        Serial.println("BLE Client Connected");
+        // Stop advertising to allow faster connections and save power
+        NimBLEDevice::getAdvertising()->stop();
+    }
+    void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+        ble_connected = false;
+        Serial.println("BLE Client Disconnected");
+        // Restart advertising to allow new connections
+        NimBLEDevice::getAdvertising()->start();
+    }
+};
+
+// --- Cloud Voice Recognition (Alibaba Cloud) ---
+// 请注意：您需要开通阿里云语音识别服务并获取AppKey
+// https://help.aliyun.com/document_detail/90223.html
+const String ALI_APP_KEY = "30KWzengxVDXidk2";
+const String ALI_ACCESS_TOKEN = "8d5f2e00f2934a4eac2af5f06913e069";
+const char* ALI_ASR_HOST = "nls-gateway-cn-shanghai.aliyuncs.com";
+const char* ALI_ASR_URL_PATH = "/stream/v1/asr";
+const int RECORD_SECONDS = 3;
 
 // --- HUB75 LED 屏幕参数配置 ---
 #define PANEL_WIDTH   64
@@ -87,7 +148,7 @@ bool force_redraw_weather_clock = true; // 新增: 天气时钟模式强制刷�
 String last_displayed_time = ""; // 用于检测时间变化
 
 // --- Weather Data Store ---
-String weather_description = "Loading...";
+String weather_description = "Loading";
 float temperature = 0.0;
 float humidity = 0.0;  // 新增：湿度数据
 String weather_icon_code = ""; // e.g., "01d", "10n"
@@ -158,6 +219,11 @@ void display_weather_clock();
 void draw_text_with_outline(int16_t x, int16_t y, const String& text, uint16_t text_color, uint16_t outline_color, uint8_t size, bool centerX);
 void draw_temp_humidity();  // 新增：专门用于绘制温湿度的函数
 void handle_gesture_input();
+void handle_voice_command(); // 新增：处理语音指令的函数
+int16_t* record_audio(size_t& data_size); // 新增：录音函数
+void setup_ble(); // 新增：蓝牙初始化函数
+void send_media_key(uint16_t key); // 新增：发送媒体按键函数
+void execute_media_command(String result_text); // 新增：执行媒体指令函数
 
 // --- Web服务器函数 --- 
 void setup_webserver();
@@ -579,6 +645,7 @@ void setup() {
   setup_i2s_microphone();
   setup_paj7620_sensor(); // <<<<<<<<<<< 新增：调用手势传感器初始化
   setup_wifi(); // Connect to WiFi and initialize NTP
+  setup_ble(); // 新增：初始化蓝牙
   
   // 设置Web服务器
   setup_webserver();
@@ -606,30 +673,69 @@ void setup() {
 
   Serial.println("Setup complete. Initial mode: Spectrum Display.");
   current_mode = SPECTRUM_MODE; // Explicitly set initial mode
-  mode_changed = true; // Trigger initial display update for the mode
+  mode_changed = true; // Trigger initial display update
 }
 
 void handle_gesture_input() {
     Gesture gesture = paj_sensor.readGesture();
+    if (gesture == GES_NONE) {
+        return; // 没有检测到手势，直接返回
+    }
+
     bool mode_switched_this_cycle = false;
 
-    if (gesture == GES_CLOCKWISE) {
+    // 在天气时钟模式下，顺时针/逆时针触发语音识别
+    if (current_mode == WEATHER_CLOCK_MODE && (gesture == GES_CLOCKWISE || gesture == GES_ANTICLOCKWISE)) {
+        Serial.println("Gesture: Voice Recognition Triggered!");
+        handle_voice_command();
+        return; // 处理完语音指令后直接返回，避免执行后续的模式切换逻辑
+    }
+
+    // 新增：使用向前/向后手势控制音乐播放
+    if (ble_connected) {
+        if (gesture == GES_FORWARD) {
+            Serial.println("Gesture: FORWARD - Sending Play/Pause command");
+            send_media_key(HID_CONSUMER_PLAY_PAUSE);
+            if(dma_display){
+                dma_display->clearScreen();
+                draw_text_with_outline(0, 12, "Play/Pause", dma_display->color565(0,255,0), dma_display->color565(0,50,0), 1, true);
+                dma_display->flipDMABuffer();
+                delay(1000);
+                force_redraw_weather_clock = true; // 刷新时钟界面
+            }
+            return;
+        } else if (gesture == GES_BACKWARD) {
+            Serial.println("Gesture: BACKWARD - Sending Stop command");
+            send_media_key(HID_CONSUMER_STOP);
+            if(dma_display){
+                dma_display->clearScreen();
+                draw_text_with_outline(0, 12, "Stop", dma_display->color565(255,0,0), dma_display->color565(50,0,0), 1, true);
+                dma_display->flipDMABuffer();
+                delay(1000);
+                force_redraw_weather_clock = true; // 刷新时钟界面
+            }
+            return;
+        }
+    }
+
+    // 使用左/右滑切换模式
+    if (gesture == GES_RIGHT) { // 右滑切换到天气时钟
         if (current_mode != WEATHER_CLOCK_MODE) {
-            Serial.println("Gesture: CLOCKWISE - Switching to Weather/Clock mode");
+            Serial.println("Gesture: RIGHT - Switching to Weather/Clock mode");
             current_mode = WEATHER_CLOCK_MODE;
             mode_changed = true; 
             force_redraw_weather_clock = true; 
             mode_switched_this_cycle = true;
         }
-    } else if (gesture == GES_ANTICLOCKWISE) {
+    } else if (gesture == GES_LEFT) { // 左滑切换到频谱
         if (current_mode != SPECTRUM_MODE) {
-            Serial.println("Gesture: ANTICLOCKWISE - Switching to Spectrum mode");
+            Serial.println("Gesture: LEFT - Switching to Spectrum mode");
             current_mode = SPECTRUM_MODE;
             mode_changed = true;
             mode_switched_this_cycle = true;
         }
-    } else if (gesture != GES_NONE && gesture != GES_WAVE && gesture != GES_LEFT && gesture != GES_RIGHT) { 
-        Serial.print("Gesture detected: ");
+    } else if (gesture != GES_WAVE) { // 打印其他未被处理的手势
+        Serial.print("Other gesture detected: ");
         printGestureName(gesture);
     }
 
@@ -976,7 +1082,7 @@ void display_weather_clock() {
         int16_t x1_clk, y1_clk; uint16_t w_clk, h_clk; // 修改变量名避免冲突
         dma_display->setTextSize(clock_size);
         dma_display->getTextBounds(cur_hhmm, 0, 0, &x1_clk, &y1_clk, &w_clk, &h_clk);
-        int16_t clock_x = (PANEL_WIDTH - w_clk) / 2;
+        int16_t clock_x = (PANEL_WIDTH - w_clk) / 2 + 1; // 整体向右移动一格
         int16_t clock_y = 0 + 3;
         draw_bold_clock(clock_x, clock_y, cur_hhmm, time_color, outline_color, clock_size);
         
@@ -1379,4 +1485,286 @@ void draw_temp_humidity() {
     
     // 恢复默认字体
     dma_display->setFont();
+}
+
+// 新增/修改：实现语音指令处理的函数
+void handle_voice_command() {
+    if (!dma_display) return;
+
+    Serial.println("Starting voice recognition process...");
+
+    // 1. 录制真实音频 (内置动画)
+    size_t audio_data_size = 0;
+    int16_t* audio_buffer = record_audio(audio_data_size);
+    uint16_t text_color = dma_display->color565(255, 255, 0); // Yellow
+    uint16_t outline_color = dma_display->color565(50, 50, 0);
+
+
+    if (audio_buffer == nullptr || audio_data_size == 0) {
+        Serial.println("Audio recording failed.");
+        dma_display->clearScreen();
+        draw_text_with_outline(0, 12, "REC FAIL", dma_display->color565(255,0,0), dma_display->color565(50,0,0), 1, true);
+        dma_display->flipDMABuffer();
+        delay(2000);
+        force_redraw_weather_clock = true;
+        return;
+    }
+
+    // 2. 发送音频到阿里云进行识别
+    dma_display->clearScreen();
+    draw_text_with_outline(0, 12, "Processing", text_color, outline_color, 1, true);
+    dma_display->flipDMABuffer();
+
+    HTTPClient http;
+    String url = String("https://") + ALI_ASR_HOST + ALI_ASR_URL_PATH +
+                 "?appkey=" + ALI_APP_KEY +
+                 "&format=pcm" +
+                 "&sample_rate=" + String(I2S_SAMPLE_RATE);
+
+    Serial.println("Connecting to URL: " + url);
+    
+    http.begin(url);
+    http.addHeader("X-NLS-Token", ALI_ACCESS_TOKEN);
+    http.addHeader("Content-Type", "application/octet-stream");
+    
+    int httpCode = http.sendRequest("POST", (uint8_t*)audio_buffer, audio_data_size);
+    
+    // 释放音频缓冲区
+    free(audio_buffer);
+
+    if (httpCode > 0) {
+        Serial.printf("[HTTP] POST... code: %d\n", httpCode);
+        if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            Serial.println("--- Response Payload ---");
+            Serial.println(payload);
+            Serial.println("------------------------");
+
+            DynamicJsonDocument doc(1024);
+            DeserializationError error = deserializeJson(doc, payload);
+
+            if (error) {
+                Serial.print(F("deserializeJson() failed: "));
+                Serial.println(error.c_str());
+                draw_text_with_outline(0, 12, "PARSE FAIL", text_color, outline_color, 1, true);
+            } else {
+                int status = doc["status"];
+                String result = doc["result"];
+                String task_id = doc["task_id"];
+
+                Serial.println("--- Parsed Result ---");
+                Serial.printf("Task ID: %s\n", task_id.c_str());
+                Serial.printf("Status: %d\n", status);
+                Serial.printf("Result: %s\n", result.c_str());
+                Serial.println("---------------------");
+                
+                if (status == 20000000 && result.length() > 0) {
+                   draw_text_with_outline(0, 12, result, text_color, outline_color, 1, true);
+                   dma_display->flipDMABuffer(); // 先在屏幕显示识别结果
+                   delay(1500);                  // 停留片刻让用户看到
+                   execute_media_command(result); // 再执行对应的指令
+                } else {
+                   draw_text_with_outline(0, 12, "NO RESULT", text_color, outline_color, 1, true);
+                   dma_display->flipDMABuffer(); // 显示识别失败
+                   delay(2000); 
+                }
+            }
+        }
+    } else {
+        Serial.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
+        draw_text_with_outline(0, 12, "HTTP FAIL", text_color, outline_color, 1, true);
+        dma_display->flipDMABuffer();
+        delay(2000);
+    }
+    http.end();
+    
+    // 识别流程结束后，短暂延迟后刷新时钟
+    delay(500); 
+
+    // 4. 识别完毕后，强制刷新一次天气时钟界面，恢复显示
+    Serial.println("Voice command processing finished. Redrawing clock.");
+    force_redraw_weather_clock = true;
+}
+
+// 新增：录制指定秒数的16-bit PCM音频
+int16_t* record_audio(size_t& data_size) {
+    const size_t record_samples = RECORD_SECONDS * I2S_SAMPLE_RATE;
+    const size_t buffer_size = record_samples * sizeof(int16_t);
+    
+    // 尝试在PSRAM中分配内存
+    int16_t* audio_buffer = (int16_t*) ps_malloc(buffer_size);
+    if (!audio_buffer) {
+        Serial.println("Failed to allocate memory for audio buffer!");
+        data_size = 0;
+        return nullptr;
+    }
+    Serial.printf("Audio buffer allocated at %p with size %d bytes\n", audio_buffer, buffer_size);
+
+    const size_t i2s_read_chunk_samples = 512;
+    const size_t i2s_read_chunk_bytes = i2s_read_chunk_samples * sizeof(int32_t);
+    int32_t* i2s_read_buf = (int32_t*) malloc(i2s_read_chunk_bytes);
+    if (!i2s_read_buf) {
+        Serial.println("Failed to allocate I2S read buffer");
+        free(audio_buffer);
+        data_size = 0;
+        return nullptr;
+    }
+
+    Serial.printf("Recording %d seconds of audio with animation...\n", RECORD_SECONDS);
+    size_t total_samples_read = 0;
+    i2s_read(I2S_PORT_NUM, NULL, 0, &total_samples_read, 0); // Clear any old data in DMA buffer
+
+    // Animation variables
+    unsigned long last_anim_time = millis();
+    int dot_count = 1;
+    const int max_dots = 3; // 动画只显示1到3个点
+    uint16_t text_color = dma_display->color565(255, 255, 0); // Yellow
+    uint16_t outline_color = dma_display->color565(50, 50, 0);
+
+
+    while (total_samples_read < record_samples) {
+        // Animation Logic
+        if (dma_display && millis() - last_anim_time > 330) { // 更新动画
+            dma_display->clearScreen();
+            String ellipsis_text = ""; // 只显示点
+            for (int i = 0; i < dot_count; i++) {
+                ellipsis_text += ".";
+            }
+            // 使用更大的字号（size 2）并调整y坐标使其垂直居中
+            draw_text_with_outline(0, 8, ellipsis_text, text_color, outline_color, 2, true);
+            dma_display->flipDMABuffer();
+            
+            dot_count++;
+            if (dot_count > max_dots) {
+                dot_count = 1;
+            }
+            last_anim_time = millis();
+        }
+
+        // I2S Read Logic
+        size_t bytes_read = 0;
+        // Use a small timeout to make the loop responsive for animation
+        esp_err_t result = i2s_read(I2S_PORT_NUM, i2s_read_buf, i2s_read_chunk_bytes, &bytes_read, pdMS_TO_TICKS(20));
+
+        if (result == ESP_OK && bytes_read > 0) {
+            int samples_read = bytes_read / sizeof(int32_t);
+            for (int i = 0; i < samples_read; i++) {
+                if (total_samples_read + i < record_samples) {
+                    // 将32位样本转换为16位样本 (取高16位)
+                    audio_buffer[total_samples_read + i] = (int16_t)(i2s_read_buf[i] >> 16);
+                }
+            }
+            total_samples_read += samples_read;
+        } else if (result != ESP_ERR_TIMEOUT && result != ESP_OK) {
+             // 只在发生真实错误时打印 (忽略超时和成功的0字节读取)
+             Serial.printf("I2S read error: %d\n", result);
+        }
+    }
+    
+    free(i2s_read_buf);
+    Serial.printf("Recording finished. Total samples captured: %d\n", total_samples_read);
+    data_size = total_samples_read * sizeof(int16_t);
+    return audio_buffer;
+}
+
+// 新增：实现带描边的文字绘制函数（原文件中只有声明没有定义）
+void draw_text_with_outline(int16_t x, int16_t y, const String& text, uint16_t text_color, uint16_t outline_color, uint8_t size, bool centerX) {
+    if (!dma_display) return;
+    
+    dma_display->setTextSize(size);
+    int16_t x1, y1;
+    uint16_t w, h;
+    dma_display->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+
+    int16_t final_x = x;
+    int16_t final_y = y;
+
+    if (centerX) {
+        final_x = (PANEL_WIDTH - w) / 2;
+    }
+    
+    // Draw outline
+    dma_display->setTextColor(outline_color);
+    for (int8_t dx = -1; dx <= 1; dx++) {
+        for (int8_t dy = -1; dy <= 1; dy++) {
+            if (dx == 0 && dy == 0) continue;
+            dma_display->setCursor(final_x + dx, final_y + dy);
+            dma_display->print(text);
+        }
+    }
+
+    // Draw text
+    dma_display->setTextColor(text_color);
+    dma_display->setCursor(final_x, final_y);
+    dma_display->print(text);
+}
+
+// 新增：初始化BLE媒体控制服务
+void setup_ble() {
+    Serial.println("--- Initializing BLE Media Control Service ---");
+    NimBLEDevice::init("ESP32-S3 Media Control"); // Device name
+    NimBLEServer* pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    hid = new NimBLEHIDDevice(pServer);
+    input_consumer_control = hid->inputReport(1); // Report ID 1
+
+    hid->manufacturer()->setValue("Espressif");
+    hid->pnp(0x02, 0xe502, 0xa111, 0x0210); // PnP ID
+    hid->hidInfo(0x00, 0x01); // HID version 1.11, Country code 0 (not localized)
+
+    hid->reportMap((uint8_t*)hid_report_descriptor, sizeof(hid_report_descriptor));
+    
+    hid->startServices();
+
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->setAppearance(HID_KEYBOARD); // Advertise as a HID device (keyboard is close enough)
+    pAdvertising->addServiceUUID(hid->hidService()->getUUID());
+    pAdvertising->start();
+    
+    Serial.println("BLE Advertising started. You can now pair with your phone.");
+}
+
+// 新增：发送媒体按键指令
+void send_media_key(uint16_t key) {
+    if (ble_connected && input_consumer_control) {
+        Serial.printf("Sending media key: 0x%04X\n", key);
+        input_consumer_control->setValue((uint8_t*)&key, 2); // 修复：将指针类型转换为uint8_t*
+        input_consumer_control->notify();
+        delay(15); // a small delay
+        // Release the key
+        key = 0;
+        input_consumer_control->setValue((uint8_t*)&key, 2); // 修复：将指针类型转换为uint8_t*
+        input_consumer_control->notify();
+    } else {
+        Serial.println("Cannot send media key: BLE not connected.");
+    }
+}
+
+// 新增：根据语音识别文本执行媒体指令
+void execute_media_command(String result_text) {
+    if (!ble_connected) {
+        Serial.println("Voice command received, but BLE not connected.");
+        if(dma_display) {
+            dma_display->clearScreen();
+            draw_text_with_outline(0, 12, "BLE D/C", dma_display->color565(255, 165, 0), dma_display->color565(50, 50, 0), 1, true);
+            dma_display->flipDMABuffer();
+            delay(2000);
+        }
+        return;
+    }
+    
+    Serial.printf("Executing command for text: %s\n", result_text.c_str());
+
+    if (result_text.indexOf("播放") != -1 || result_text.indexOf("暂停") != -1) {
+        send_media_key(HID_CONSUMER_PLAY_PAUSE);
+    } else if (result_text.indexOf("停止") != -1) {
+        send_media_key(HID_CONSUMER_STOP);
+    } else if (result_text.indexOf("下一首") != -1 || result_text.indexOf("下一个") != -1) {
+        send_media_key(HID_CONSUMER_NEXT_TRACK);
+    } else if (result_text.indexOf("上一首") != -1 || result_text.indexOf("上一个") != -1) {
+        send_media_key(HID_CONSUMER_PREV_TRACK);
+    } else {
+        Serial.println("No media keyword found in recognized text.");
+    }
 }

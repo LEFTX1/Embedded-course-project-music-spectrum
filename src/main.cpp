@@ -5,12 +5,19 @@
 #include <math.h>
 #include <Wire.h>             // <<<<<<<<<<< 新增：包含 Wire 库
 #include "RevEng_PAJ7620.h" // <<<<<<<<<<< 新增：包含 PAJ7620 库头文件
+// 添加最小字体头文件
+#include <Fonts/Tiny3x3a2pt7b.h>
+#include <Fonts/Picopixel.h>
 
 // --- WiFi ---
 #include <WiFi.h>
 #include <HTTPClient.h> // For OpenWeatherMap
 #include <ArduinoJson.h> // For OpenWeatherMap
 #include "time.h"       // For NTP time
+// --- Web服务器 ---
+#include <WebServer.h>  // 新增：Web服务器
+#include <SPIFFS.h>     // 新增：文件系统
+#include <WebSocketsServer.h> // 新增：WebSocket服务器
 
 // --- HUB75 LED 屏幕参数配置 ---
 #define PANEL_WIDTH   64
@@ -46,6 +53,13 @@ MatrixPanel_I2S_DMA *dma_display = nullptr;
 #define PAJ_SCL_PIN 7 // <<<<<<<<<<< 新增
 RevEng_PAJ7620 paj_sensor;  // <<<<<<<<<<< 新增：创建传感器对象
 
+// --- Web服务器配置 ---
+WebServer server(80);  // Web服务器对象
+WebSocketsServer webSocket = WebSocketsServer(81); // WebSocket服务器对象
+String web_message = "";  // 用于显示网页消息
+float current_noise_level = 0.0f; // 当前噪声水平
+unsigned long last_ws_update = 0; // 上次WebSocket更新时间
+
 // --- WiFi Credentials ---
 const char* WIFI_SSID = "areyouok";
 const char* WIFI_PASSWORD = "888888888";
@@ -75,6 +89,7 @@ String last_displayed_time = ""; // 用于检测时间变化
 // --- Weather Data Store ---
 String weather_description = "Loading...";
 float temperature = 0.0;
+float humidity = 0.0;  // 新增：湿度数据
 String weather_icon_code = ""; // e.g., "01d", "10n"
 unsigned long last_weather_update = 0;
 // Update weather every 15 minutes (15 * 60 * 1000 milliseconds)
@@ -100,9 +115,10 @@ int band_end_bins[NUM_BANDS];
 const float FREQ_RESOLUTION = (float)I2S_SAMPLE_RATE / FFT_SAMPLES_COUNT;
 const int USEFUL_FFT_BINS = FFT_SAMPLES_COUNT / 2;
 
-#define NOISE_FLOOR 26000.0f
-#define MAX_AMP_LOG 8.8f
-#define MIN_AMP_LOG 4.3f
+// 音频分析相关参数 - 转为可在网页上配置的变量
+float noise_floor = 26000.0f;  // 默认值, 原来是 #define NOISE_FLOOR 26000.0f
+float max_amp_log = 8.8f;      // 默认值, 原来是 #define MAX_AMP_LOG 8.8f
+float min_amp_log = 4.3f;      // 默认值, 原来是 #define MIN_AMP_LOG 4.3f
 #define BAR_SENSITIVITY 1.0f
 
 float band_heights[NUM_BANDS];
@@ -140,7 +156,17 @@ void update_time();
 void display_spectrum();
 void display_weather_clock();
 void draw_text_with_outline(int16_t x, int16_t y, const String& text, uint16_t text_color, uint16_t outline_color, uint8_t size, bool centerX);
+void draw_temp_humidity();  // 新增：专门用于绘制温湿度的函数
 void handle_gesture_input();
+
+// --- Web服务器函数 --- 
+void setup_webserver();
+void handle_root();
+void handle_save_config();
+void save_config();
+void load_config();
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void handle_websocket_updates();
 
 // >>>>>>>>>>>>>>>>>> START: 天气图标与绘制函数 <<<<<<<<<<<<<<<<<<
 // --- Icon Data (8x8, using RGB888, will be converted to 565) ---
@@ -540,10 +566,22 @@ void setup() {
   delay(1000);
   Serial.println("Starting setup...");
 
+  // 初始化SPIFFS文件系统
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS挂载失败");
+  } else {
+    Serial.println("SPIFFS挂载成功");
+    // 加载保存的配置
+    load_config();
+  }
+
   setup_hub75_display();
   setup_i2s_microphone();
   setup_paj7620_sensor(); // <<<<<<<<<<< 新增：调用手势传感器初始化
   setup_wifi(); // Connect to WiFi and initialize NTP
+  
+  // 设置Web服务器
+  setup_webserver();
 
   calculate_linear_bins();
 
@@ -575,22 +613,22 @@ void handle_gesture_input() {
     Gesture gesture = paj_sensor.readGesture();
     bool mode_switched_this_cycle = false;
 
-    if (gesture == GES_RIGHT) {
+    if (gesture == GES_CLOCKWISE) {
         if (current_mode != WEATHER_CLOCK_MODE) {
-            Serial.println("Gesture: RIGHT - Switching to Weather/Clock mode");
+            Serial.println("Gesture: CLOCKWISE - Switching to Weather/Clock mode");
             current_mode = WEATHER_CLOCK_MODE;
             mode_changed = true; 
             force_redraw_weather_clock = true; 
             mode_switched_this_cycle = true;
         }
-    } else if (gesture == GES_LEFT) {
+    } else if (gesture == GES_ANTICLOCKWISE) {
         if (current_mode != SPECTRUM_MODE) {
-            Serial.println("Gesture: LEFT - Switching to Spectrum mode");
+            Serial.println("Gesture: ANTICLOCKWISE - Switching to Spectrum mode");
             current_mode = SPECTRUM_MODE;
             mode_changed = true;
             mode_switched_this_cycle = true;
         }
-    } else if (gesture != GES_NONE && gesture != GES_WAVE && gesture != GES_CLOCKWISE && gesture != GES_ANTICLOCKWISE) { 
+    } else if (gesture != GES_NONE && gesture != GES_WAVE && gesture != GES_LEFT && gesture != GES_RIGHT) { 
         Serial.print("Gesture detected: ");
         printGestureName(gesture);
     }
@@ -655,6 +693,7 @@ void fetch_weather_data() {
                 
                 JsonObject main = doc["main"];
                 temperature = main["temp"].as<float>();
+                humidity = main["humidity"].as<float>();  // 新增：获取湿度数据
 
                 Serial.println("Raw weather_description from API: " + raw_desc);
 
@@ -684,7 +723,7 @@ void fetch_weather_data() {
                 // 更新全局变量
                 weather_description = display_desc;
 
-                Serial.printf("Mapped Weather: %s, Temp: %.1fC, Icon: %s\n", weather_description.c_str(), temperature, weather_icon_code.c_str());
+                Serial.printf("Mapped Weather: %s, Temp: %.1fC, Humidity: %.1f%%, Icon: %s\n", weather_description.c_str(), temperature, humidity, weather_icon_code.c_str());
                 last_weather_update = millis(); 
 
             } else {
@@ -729,13 +768,18 @@ void display_spectrum() {
             }
         }
         float representative_amplitude = max_amplitude_in_band;
+        // 更新band_idx=32(中间频段)的振幅作为噪声指示器参考
+        if (band_idx == 32) {
+          current_noise_level = representative_amplitude;
+        }
+        
         float current_log_amp = 0.0f;
-        if (representative_amplitude > NOISE_FLOOR) {
+        if (representative_amplitude > noise_floor) {
           current_log_amp = log10f(representative_amplitude);
           if (isinf(current_log_amp) || isnan(current_log_amp)) current_log_amp = 0.0f;}
         float normalized_amp = 0.0f;
-        if ((MAX_AMP_LOG - MIN_AMP_LOG) > 0.001f) {
-           normalized_amp = (current_log_amp - MIN_AMP_LOG) / (MAX_AMP_LOG - MIN_AMP_LOG);}
+        if ((max_amp_log - min_amp_log) > 0.001f) {
+           normalized_amp = (current_log_amp - min_amp_log) / (max_amp_log - min_amp_log);}
         normalized_amp = constrain(normalized_amp * BAR_SENSITIVITY, 0.0f, 1.0f);
         float target_height;
         float screen_max_pixels = (float)PANEL_HEIGHT - 1.0f;
@@ -929,34 +973,15 @@ void display_weather_clock() {
         uint16_t time_color = hsv_to_panel_color(200, 1, fade_v);
         uint16_t outline_color = hsv_to_panel_color(0, 0, 0.2);
         uint8_t clock_size = 2;
-        int16_t x1, y1; uint16_t w, h;
+        int16_t x1_clk, y1_clk; uint16_t w_clk, h_clk; // 修改变量名避免冲突
         dma_display->setTextSize(clock_size);
-        dma_display->getTextBounds(cur_hhmm, 0, 0, &x1, &y1, &w, &h);
-        int16_t clock_x = (PANEL_WIDTH - w) / 2;
+        dma_display->getTextBounds(cur_hhmm, 0, 0, &x1_clk, &y1_clk, &w_clk, &h_clk);
+        int16_t clock_x = (PANEL_WIDTH - w_clk) / 2;
         int16_t clock_y = 0 + 3;
         draw_bold_clock(clock_x, clock_y, cur_hhmm, time_color, outline_color, clock_size);
-        // 温度
-    String temp_num_str = String(temperature, 0);
-    uint16_t temp_color = hsv_to_panel_color(60,1,1);
-    dma_display->setTextColor(temp_color);
-    dma_display->setTextSize(1);
-    int16_t x1_temp_num, y1_temp_num; uint16_t w_temp_num, h_temp_num;
-    dma_display->getTextBounds(temp_num_str, 0, 0, &x1_temp_num, &y1_temp_num, &w_temp_num, &h_temp_num);
-        uint8_t degree_radius = 1;
-        uint8_t spacing_after_num = 1;
-        uint8_t spacing_after_degree = 1;
-    int16_t x1_c, y1_c; uint16_t w_c, h_c;
-    dma_display->getTextBounds("C", 0, 0, &x1_c, &y1_c, &w_c, &h_c);
-    int16_t temp_y_baseline = PANEL_HEIGHT - h_temp_num - 2;
-        int16_t temp_start_x = 4;
-    dma_display->setCursor(temp_start_x, temp_y_baseline);
-    dma_display->print(temp_num_str);
-        int16_t circle_cx = temp_start_x + w_temp_num + spacing_after_num + degree_radius;
-        int16_t circle_cy = temp_y_baseline + degree_radius -1;
-        dma_display->drawCircle(circle_cx, circle_cy, degree_radius, temp_color);
-        dma_display->drawCircle(circle_cx, circle_cy, degree_radius-1, temp_color);
-        dma_display->setCursor(circle_cx + degree_radius + spacing_after_degree, temp_y_baseline);
-    dma_display->print("C");
+        
+        // 调用专门的函数来绘制温湿度
+        draw_temp_humidity();
         // 秒区先用黑色块覆盖
         dma_display->fillRect(PANEL_WIDTH-18, PANEL_HEIGHT-14, 18, 14, 0);
         // 天气图标 8x8，放在屏幕中下方，右下角往左25格，往上一格，保证完全可见且不与秒区重叠
@@ -989,6 +1014,13 @@ void display_weather_clock() {
 void loop() {
   if (!dma_display) return;
 
+  // 处理Web服务器请求
+  server.handleClient();
+  
+  // 处理WebSocket事件
+  webSocket.loop();
+  handle_websocket_updates();
+
   handle_gesture_input(); 
 
   if (current_mode == SPECTRUM_MODE) {
@@ -1017,4 +1049,334 @@ void printGestureName(Gesture gesture) {
     case GES_WAVE: Serial.println("WAVE (挥手)"); break;
     default: Serial.println("UNKNOWN GESTURE"); break;
   }
+}
+
+// --- Web服务器相关函数实现 ---
+
+// 设置Web服务器
+void setup_webserver() {
+  // 配置路由
+  server.on("/", HTTP_GET, handle_root);
+  server.on("/save", HTTP_POST, handle_save_config);
+  
+  // 启动HTTP服务器
+  server.begin();
+  Serial.println("Web服务器已启动");
+  Serial.print("请访问: http://");
+  Serial.println(WiFi.localIP());
+  
+  // 启动WebSocket服务器
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("WebSocket服务器已启动");
+}
+
+// 处理根路径请求，显示配置页面
+void handle_root() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>"; // 添加UTF-8编码设置
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>音频频谱参数配置</title>";
+  html += "<style>";
+  html += "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;}";
+  html += ".container{background:white;padding:20px;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+  html += "h1{color:#333;text-align:center;}";
+  html += "form{max-width:500px;margin:0 auto;}";
+  html += ".form-group{margin-bottom:15px;}";
+  html += "label{display:block;margin-bottom:5px;font-weight:bold;}";
+  html += "input[type=number]{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;}";
+  html += "button{background:#4CAF50;color:white;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:16px;}";
+  html += "button:hover{background:#45a049;}";
+  html += ".message{padding:10px;margin-top:20px;border-radius:4px;text-align:center;}";
+  html += ".success{background:#d4edda;color:#155724;}";
+  html += "</style>";
+  
+  // 添加WebSocket和可视化的JavaScript代码
+  html += "<script>";
+  html += "let ws;";
+  html += "let noiseLevel = 0;";
+  html += "let noiseFloor = " + String(noise_floor) + ";";
+  html += "let canvas, ctx;";
+  html += "let historyData = Array(100).fill(0);";
+  
+  // WebSocket连接
+  html += "function connectWebSocket() {";
+  html += "  ws = new WebSocket('ws://' + window.location.hostname + ':81/');";
+  html += "  ws.onopen = function() {";
+  html += "    console.log('WebSocket连接成功');";
+  html += "  };";
+  html += "  ws.onmessage = function(evt) {";
+  html += "    try {";
+  html += "      let data = JSON.parse(evt.data);";
+  html += "      noiseLevel = data.noise_level;";
+  html += "      noiseFloor = data.noise_floor;";
+  html += "      updateVisualizer();";
+  html += "    } catch(e) {";
+  html += "      console.error('解析WebSocket数据出错:', e);";
+  html += "    }";
+  html += "  };";
+  html += "  ws.onclose = function() {";
+  html += "    setTimeout(connectWebSocket, 2000);";
+  html += "  };";
+  html += "}";
+  
+  // 初始化可视化器
+  html += "function initVisualizer() {";
+  html += "  canvas = document.getElementById('noiseVisualizer');";
+  html += "  ctx = canvas.getContext('2d');";
+  html += "  window.setInterval(updateVisualizer, 100);"; // 即使WebSocket不更新也每100ms刷新一次
+  html += "}";
+  
+  // 更新可视化器
+  html += "function updateVisualizer() {";
+  html += "  if (!ctx) return;";
+  html += "  ctx.clearRect(0, 0, canvas.width, canvas.height);";
+  
+  // 移动历史数据
+  html += "  historyData.shift();";
+  html += "  historyData.push(noiseLevel);";
+  
+  // 绘制背景
+  html += "  ctx.fillStyle = '#f8f8f8';";
+  html += "  ctx.fillRect(0, 0, canvas.width, canvas.height);";
+  
+  // 绘制噪声阈值线
+  html += "  ctx.beginPath();";
+  html += "  ctx.strokeStyle = '#ff6347';"; // 番茄红
+  html += "  ctx.lineWidth = 2;";
+  html += "  ctx.moveTo(0, scaleValue(noiseFloor));";
+  html += "  ctx.lineTo(canvas.width, scaleValue(noiseFloor));";
+  html += "  ctx.stroke();";
+  
+  // 绘制当前噪声水平
+  html += "  ctx.beginPath();";
+  html += "  ctx.strokeStyle = '#4682b4';"; // 钢蓝色
+  html += "  ctx.lineWidth = 2;";
+  html += "  for (let i = 0; i < historyData.length; i++) {";
+  html += "    let x = (i / historyData.length) * canvas.width;";
+  html += "    let y = scaleValue(historyData[i]);";
+  html += "    if (i === 0) {";
+  html += "      ctx.moveTo(x, y);";
+  html += "    } else {";
+  html += "      ctx.lineTo(x, y);";
+  html += "    }";
+  html += "  }";
+  html += "  ctx.stroke();";
+  
+  // 绘制图例
+  html += "  ctx.fillStyle = '#000';";
+  html += "  ctx.font = '10px Arial';";
+  html += "  ctx.fillText('噪声水平: ' + Math.round(noiseLevel), 5, 15);";
+  html += "  ctx.fillText('阈值: ' + Math.round(noiseFloor), canvas.width - 80, 15);";
+  html += "}";
+  
+  // 缩放值到画布高度
+  html += "function scaleValue(val) {";
+  html += "  const minVal = 10000;";
+  html += "  const maxVal = 40000;";
+  html += "  const scaledVal = 1 - ((val - minVal) / (maxVal - minVal));";
+  html += "  return scaledVal * (canvas.height - 20) + 10;"; // 上下留10px边距
+  html += "}";
+  
+  // 页面加载后初始化
+  html += "window.addEventListener('load', function() {";
+  html += "  initVisualizer();";
+  html += "  connectWebSocket();";
+  html += "  document.getElementById('noise_floor').addEventListener('input', function() {";
+  html += "    noiseFloor = parseFloat(this.value);";
+  html += "    updateVisualizer();";
+  html += "  });";
+  html += "});";
+  html += "</script>";
+  html += "</head><body>";
+  
+  html += "<div class='container'>";
+  html += "<h1>音频频谱参数配置</h1>";
+  
+  if (web_message != "") {
+    html += "<div class='message success'>" + web_message + "</div>";
+    web_message = ""; // 清除消息
+  }
+  
+  html += "<form action='/save' method='POST'>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='noise_floor'>噪声基准 (Noise Floor):</label>";
+  html += "<p style='font-size:12px;color:#666;'>较高的值会过滤更多背景噪音，较低的值会使显示对较弱的声音更敏感</p>";
+  
+  // 添加噪声可视化组件
+  html += "<div style='margin:10px 0;'>";
+  html += "<canvas id='noiseVisualizer' width='280' height='80' style='width:100%;border:1px solid #ddd;border-radius:4px;'></canvas>";
+  html += "<div id='legend' style='display:flex;justify-content:space-between;font-size:11px;margin-top:3px;'>";
+  html += "<span>实时噪声水平</span><span>噪声阈值</span>";
+  html += "</div></div>";
+  
+  html += "<input type='number' id='noise_floor' name='noise_floor' value='" + String(noise_floor) + "' step='1000' min='10000' max='40000'>";
+  html += "<div style='display:flex;justify-content:space-between;font-size:12px;'><span>更敏感(10000)</span><span>更抗噪(40000)</span></div>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='max_amp_log'>最大对数振幅 (Max Amp Log):</label>";
+  html += "<input type='number' id='max_amp_log' name='max_amp_log' value='" + String(max_amp_log) + "' step='0.1'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='min_amp_log'>最小对数振幅 (Min Amp Log):</label>";
+  html += "<input type='number' id='min_amp_log' name='min_amp_log' value='" + String(min_amp_log) + "' step='0.1'>";
+  html += "</div>";
+  
+  html += "<button type='submit'>保存配置</button>";
+  html += "</form>";
+  
+  html += "<p style='text-align:center;margin-top:20px;'>当前设备IP: " + WiFi.localIP().toString() + "</p>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// 处理保存配置的请求
+void handle_save_config() {
+  if (server.hasArg("noise_floor")) {
+    noise_floor = server.arg("noise_floor").toFloat();
+  }
+  
+  if (server.hasArg("max_amp_log")) {
+    max_amp_log = server.arg("max_amp_log").toFloat();
+  }
+  
+  if (server.hasArg("min_amp_log")) {
+    min_amp_log = server.arg("min_amp_log").toFloat();
+  }
+  
+  // 保存到SPIFFS
+  save_config();
+  
+  // 设置成功消息
+  web_message = "参数已成功保存!";
+  
+  // 重定向回主页
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// 保存配置到SPIFFS
+void save_config() {
+  // 打开文件用于写入
+  File file = SPIFFS.open("/config.txt", "w");
+  if (file) {
+    file.println(String(noise_floor));
+    file.println(String(max_amp_log));
+    file.println(String(min_amp_log));
+    file.close();
+    Serial.println("配置已保存到SPIFFS");
+  } else {
+    Serial.println("无法打开配置文件进行写入");
+  }
+}
+
+// 从SPIFFS加载配置
+void load_config() {
+  if (SPIFFS.exists("/config.txt")) {
+    File file = SPIFFS.open("/config.txt", "r");
+    if (file) {
+      String str_noise_floor = file.readStringUntil('\n');
+      String str_max_amp_log = file.readStringUntil('\n');
+      String str_min_amp_log = file.readStringUntil('\n');
+      
+      noise_floor = str_noise_floor.toFloat();
+      max_amp_log = str_max_amp_log.toFloat();
+      min_amp_log = str_min_amp_log.toFloat();
+      
+      file.close();
+      Serial.println("配置已从SPIFFS加载");
+      Serial.printf("Noise Floor: %.1f, Max Amp Log: %.1f, Min Amp Log: %.1f\n", 
+                    noise_floor, max_amp_log, min_amp_log);
+    }
+  } else {
+    Serial.println("配置文件不存在，使用默认值");
+  }
+}
+
+// WebSocket事件处理函数
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] 断开连接!\n", num);
+      break;
+    case WStype_CONNECTED:
+      {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] 连接来自 %d.%d.%d.%d 的客户端\n", num, ip[0], ip[1], ip[2], ip[3]);
+      }
+      break;
+    case WStype_TEXT:
+      // 处理来自客户端的消息（如果需要）
+      break;
+    case WStype_BIN:
+    case WStype_ERROR:
+    case WStype_FRAGMENT_TEXT_START:
+    case WStype_FRAGMENT_BIN_START:
+    case WStype_FRAGMENT:
+    case WStype_FRAGMENT_FIN:
+      break;
+  }
+}
+
+// 处理WebSocket更新
+void handle_websocket_updates() {
+  if (millis() - last_ws_update > 200) { // 每200毫秒更新一次
+    last_ws_update = millis();
+    
+    // 创建JSON对象
+    char json_str[100];
+    sprintf(json_str, "{\"noise_level\":%.1f,\"noise_floor\":%.1f}", current_noise_level, noise_floor);
+    
+    // 向所有连接的客户端广播数据
+    webSocket.broadcastTXT(json_str);
+  }
+}
+
+// 新增函数：绘制温湿度显示
+void draw_temp_humidity() {
+    // 温湿度显示 - 微型布局
+    uint16_t temp_color = hsv_to_panel_color(60,1,1);    // 黄色
+    uint16_t humid_color = hsv_to_panel_color(180,1,1);  // 蓝绿色
+    
+    // 统一位置设置 - 放在屏幕左下角紧贴边缘
+    int16_t left_margin = 1 + 6;            // 向右移动6格
+    int16_t temp_y_baseline = PANEL_HEIGHT - 1 - 3;  // 向上移动3格
+    int16_t humid_y_baseline = temp_y_baseline - 4 - 1; // 湿度在温度正上方，再额外向上1格
+    
+    // 使用 Picopixel 字体
+    dma_display->setFont(&Picopixel);
+    dma_display->setTextSize(1); // 确保字体大小为1，以实现最细的笔画
+    
+    // 温度显示（底部）
+    String temp_num_str = String(int(temperature)); // 不带小数
+    dma_display->setTextColor(temp_color);
+    
+    // 温度值
+    dma_display->setCursor(left_margin, temp_y_baseline);
+    dma_display->print(temp_num_str);
+    
+    // 获取温度宽度
+    int16_t temp_x1, temp_y1;
+    uint16_t temp_w, temp_h;
+    dma_display->getTextBounds(temp_num_str, 0, 0, &temp_x1, &temp_y1, &temp_w, &temp_h);
+    
+    // 微型摄氏度符号 (使用小圆点+C而不是完整的圆圈)
+    int16_t circle_x = left_margin + temp_w + 1; 
+    int16_t circle_y = temp_y_baseline - 2;
+    dma_display->drawPixel(circle_x, circle_y, temp_color); // 单像素作为度符号
+    dma_display->setCursor(circle_x + 1, temp_y_baseline);
+    dma_display->print("C");
+    
+    // 湿度显示（上方）
+    String humid_str = String(int(humidity)) + "%"; // 整数湿度
+    dma_display->setTextColor(humid_color);
+    dma_display->setCursor(left_margin, humid_y_baseline);
+    dma_display->print(humid_str);
+    
+    // 恢复默认字体
+    dma_display->setFont();
 }

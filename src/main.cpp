@@ -1559,10 +1559,8 @@ void handle_voice_command() {
                 Serial.println("---------------------");
                 
                 if (status == 20000000 && result.length() > 0) {
-                   draw_text_with_outline(0, 12, result, text_color, outline_color, 1, true);
-                   dma_display->flipDMABuffer(); // 先在屏幕显示识别结果
-                   delay(1500);                  // 停留片刻让用户看到
-                   execute_media_command(result); // 再执行对应的指令
+                   // 不再此处显示结果，直接交由执行函数处理
+                   execute_media_command(result);
                 } else {
                    draw_text_with_outline(0, 12, "NO RESULT", text_color, outline_color, 1, true);
                    dma_display->flipDMABuffer(); // 显示识别失败
@@ -1655,8 +1653,7 @@ int16_t* record_audio(size_t& data_size) {
                 }
             }
             total_samples_read += samples_read;
-        } else if (result != ESP_ERR_TIMEOUT && result != ESP_OK) {
-             // 只在发生真实错误时打印 (忽略超时和成功的0字节读取)
+        } else if (result != ESP_ERR_TIMEOUT) {
              Serial.printf("I2S read error: %d\n", result);
         }
     }
@@ -1756,15 +1753,44 @@ void execute_media_command(String result_text) {
     
     Serial.printf("Executing command for text: %s\n", result_text.c_str());
 
+    String feedback_text = "";
+    uint16_t key_to_send = 0;
+
     if (result_text.indexOf("播放") != -1 || result_text.indexOf("暂停") != -1) {
-        send_media_key(HID_CONSUMER_PLAY_PAUSE);
+        feedback_text = "Play/Pause";
+        key_to_send = HID_CONSUMER_PLAY_PAUSE;
     } else if (result_text.indexOf("停止") != -1) {
-        send_media_key(HID_CONSUMER_STOP);
+        feedback_text = "Stop";
+        key_to_send = HID_CONSUMER_STOP;
     } else if (result_text.indexOf("下一首") != -1 || result_text.indexOf("下一个") != -1) {
-        send_media_key(HID_CONSUMER_NEXT_TRACK);
+        feedback_text = "Next";
+        key_to_send = HID_CONSUMER_NEXT_TRACK;
     } else if (result_text.indexOf("上一首") != -1 || result_text.indexOf("上一个") != -1) {
-        send_media_key(HID_CONSUMER_PREV_TRACK);
+        feedback_text = "Prev";
+        key_to_send = HID_CONSUMER_PREV_TRACK;
     } else {
         Serial.println("No media keyword found in recognized text.");
+        // (可选) 如果没有匹配到任何指令，也可以给一个屏幕反馈
+        if(dma_display) {
+            dma_display->clearScreen();
+            draw_text_with_outline(0, 12, "Unknown", dma_display->color565(255, 100, 0), dma_display->color565(50, 50, 0), 1, true);
+            dma_display->flipDMABuffer();
+            delay(1000);
+        }
+    }
+
+    if (key_to_send != 0 && dma_display) {
+        // 先在屏幕上显示反馈
+        dma_display->clearScreen();
+        uint16_t text_color = dma_display->color565(0, 255, 0); // Green for success
+        uint16_t outline_color = dma_display->color565(0, 50, 0);
+        draw_text_with_outline(0, 12, feedback_text, text_color, outline_color, 1, true);
+        dma_display->flipDMABuffer();
+        
+        // 再发送蓝牙指令
+        send_media_key(key_to_send);
+
+        // 停留1秒显示
+        delay(1000);
     }
 }
